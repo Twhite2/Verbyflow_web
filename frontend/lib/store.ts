@@ -26,6 +26,7 @@ interface ConnectionState {
   isSpeaking: boolean
   voiceSampleCaptured: boolean
   isCapturingVoice: boolean
+  storedVoiceSample: string | null  // Store voice sample for reuse
   
   // WebSocket
   ws: WebSocket | null
@@ -43,7 +44,7 @@ interface ConnectionState {
 }
 
 export const useConnectionStore = create<ConnectionState>((set, get) => ({
-  // Initial state
+  // Initial state - Load voice sample from localStorage if available
   status: 'disconnected',
   userId: null,
   partnerId: null,
@@ -51,8 +52,9 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   messages: [],
   isRecording: false,
   isSpeaking: false,
-  voiceSampleCaptured: false,
+  voiceSampleCaptured: typeof window !== 'undefined' && localStorage.getItem('voiceSample') !== null,
   isCapturingVoice: false,
+  storedVoiceSample: typeof window !== 'undefined' ? localStorage.getItem('voiceSample') : null,
   ws: null,
   
   // Initialize connection
@@ -95,6 +97,13 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
               text: 'Partner connected! Start speaking...',
               isOwn: false,
             })
+            
+            // Auto-resend stored voice sample for new partner
+            const storedSample = get().storedVoiceSample
+            if (storedSample) {
+              console.log('Resending stored voice sample to new partner')
+              get().sendVoiceSample(storedSample)
+            }
             break
             
           case 'partner_disconnected':
@@ -239,6 +248,7 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       ws.send(JSON.stringify({ type: 'disconnect' }))
     }
     
+    // Keep voice sample and voiceSampleCaptured state for next connection
     set({ 
       status: 'connected', 
       partnerId: null,
@@ -292,12 +302,19 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
         
         console.log(`Voice sample: ${voiceData.length} chunks, ${combinedBytes.length} bytes, ${combinedVoice.length} base64 chars`)
         
-        // Send to server
+        // Send to server and store for reuse
         get().sendVoiceSample(combinedVoice)
+        
+        // Save to localStorage for persistence
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('voiceSample', combinedVoice)
+          console.log('Voice sample saved to localStorage')
+        }
         
         set({ 
           isCapturingVoice: false,
-          voiceSampleCaptured: true 
+          voiceSampleCaptured: true,
+          storedVoiceSample: combinedVoice  // Store for reuse
         })
         
         resolve()

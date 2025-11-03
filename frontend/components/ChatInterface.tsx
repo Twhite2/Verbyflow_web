@@ -127,15 +127,27 @@ export default function ChatInterface() {
               </button>
             )}
             
-            {/* Find partner button */}
+            {/* Find partner and re-capture buttons */}
             {voiceSampleCaptured && status !== 'paired' && status !== 'searching' && (
-              <button
-                onClick={findPartner}
-                className="bg-white text-purple-600 px-6 py-2 rounded-lg font-medium hover:bg-purple-50 transition-colors flex items-center space-x-2"
-              >
-                <Search size={20} />
-                <span>Find Partner</span>
-              </button>
+              <div className="flex items-center space-x-3">
+                <button
+                  onClick={findPartner}
+                  className="bg-white text-purple-600 px-6 py-2 rounded-lg font-medium hover:bg-purple-50 transition-colors flex items-center space-x-2"
+                >
+                  <Search size={20} />
+                  <span>Find Partner</span>
+                </button>
+                
+                {/* Re-capture voice button */}
+                <button
+                  onClick={captureVoiceSample}
+                  disabled={isCapturingVoice}
+                  className="bg-purple-500 text-white px-4 py-2 rounded-lg font-medium hover:bg-purple-600 transition-colors flex items-center space-x-2"
+                >
+                  <Mic size={18} />
+                  <span>Re-capture</span>
+                </button>
+              </div>
             )}
             
             {/* Disconnect button */}
