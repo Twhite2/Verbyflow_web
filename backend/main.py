@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import logging
+import asyncio
 
 from sockets import router as socket_router
 
@@ -22,6 +23,33 @@ app = FastAPI(
     description="Real-time voice translation backend",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Preload AI models at startup to avoid delays on first request
+    """
+    logger.info("🚀 Preloading AI models...")
+    
+    # Import model loaders
+    from stt import load_whisper_model
+    from tts import load_tts_model
+    
+    # Load models in parallel
+    def load_whisper():
+        load_whisper_model()
+    
+    def load_tts():
+        load_tts_model()
+    
+    # Run in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    await asyncio.gather(
+        loop.run_in_executor(None, load_whisper),
+        loop.run_in_executor(None, load_tts)
+    )
+    
+    logger.info("✅ All AI models preloaded and ready!")
 
 # CORS Configuration
 app.add_middleware(

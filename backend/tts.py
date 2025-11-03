@@ -22,13 +22,21 @@ def load_tts_model():
     
     if _tts_model is None:
         try:
+            import torch
             logger.info("Loading Coqui TTS model...")
             from TTS.api import TTS
             
-            # Load multilingual model
-            _tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2")
+            # Determine device (GPU if available)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"TTS will use device: {device}")
             
-            logger.info("TTS model loaded successfully")
+            # Load multilingual model with GPU support
+            _tts_model = TTS(
+                model_name="tts_models/multilingual/multi-dataset/xtts_v2",
+                gpu=(device == "cuda")  # Enable GPU if available
+            )
+            
+            logger.info(f"TTS model loaded successfully on {device}")
         except Exception as e:
             logger.error(f"Failed to load TTS model: {e}")
             _tts_model = None
