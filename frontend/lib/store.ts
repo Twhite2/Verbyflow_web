@@ -114,6 +114,52 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             })
             break
             
+          case 'direct_audio':
+            // Direct voice chat mode - same language, no translation
+            console.log('🎙️ Direct audio received (same language mode)')
+            
+            if (data.audio && data.audio.length > 0) {
+              try {
+                // Decode base64 audio
+                const binaryString = atob(data.audio)
+                const bytes = new Uint8Array(binaryString.length)
+                for (let i = 0; i < binaryString.length; i++) {
+                  bytes[i] = binaryString.charCodeAt(i)
+                }
+                
+                // Create audio context
+                const audioContext = new AudioContext()
+                const sampleRate = 16000 // Input audio is 16kHz
+                
+                // PCM is 16-bit (2 bytes per sample)
+                const numSamples = bytes.length / 2
+                const audioBuffer = audioContext.createBuffer(1, numSamples, sampleRate)
+                const channelData = audioBuffer.getChannelData(0)
+                
+                // Convert 16-bit PCM to float32 (-1.0 to 1.0)
+                const view = new DataView(bytes.buffer)
+                for (let i = 0; i < numSamples; i++) {
+                  const int16 = view.getInt16(i * 2, true)
+                  channelData[i] = int16 / 32768.0
+                }
+                
+                console.log('🔊 Playing direct audio! Duration:', audioBuffer.duration, 'seconds')
+                
+                // Play the audio
+                const source = audioContext.createBufferSource()
+                source.buffer = audioBuffer
+                source.connect(audioContext.destination)
+                source.start(0)
+                
+                source.onended = () => {
+                  console.log('✅ Direct audio playback finished')
+                }
+              } catch (error) {
+                console.error('❌ Failed to play direct audio:', error)
+              }
+            }
+            break
+            
           case 'audio_response':
             console.log('Received audio_response:', {
               hasAudio: !!data.audio,
