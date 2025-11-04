@@ -41,10 +41,11 @@ interface ConnectionState {
   sendVoiceSample: (audioData: string) => void
   addMessage: (message: Omit<Message, 'id' | 'timestamp'>) => void
   toggleRecording: () => void
+  loadVoiceSample: () => void
 }
 
 export const useConnectionStore = create<ConnectionState>((set, get) => ({
-  // Initial state - Load voice sample from localStorage if available
+  // Initial state - Always start with null to avoid hydration errors
   status: 'disconnected',
   userId: null,
   partnerId: null,
@@ -52,9 +53,9 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   messages: [],
   isRecording: false,
   isSpeaking: false,
-  voiceSampleCaptured: typeof window !== 'undefined' && localStorage.getItem('voiceSample') !== null,
+  voiceSampleCaptured: false,
   isCapturingVoice: false,
-  storedVoiceSample: typeof window !== 'undefined' ? localStorage.getItem('voiceSample') : null,
+  storedVoiceSample: null,
   ws: null,
   
   // Initialize connection
@@ -409,8 +410,20 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   
   // Toggle recording
   toggleRecording: () => {
-    set((state) => ({
-      isRecording: !state.isRecording
-    }))
+    set({ isRecording: !get().isRecording })
+  },
+  
+  // Load voice sample from localStorage (call from useEffect client-side only)
+  loadVoiceSample: () => {
+    if (typeof window !== 'undefined') {
+      const voiceSample = localStorage.getItem('voiceSample')
+      if (voiceSample) {
+        set({ 
+          storedVoiceSample: voiceSample,
+          voiceSampleCaptured: true
+        })
+        console.log('Voice sample loaded from localStorage')
+      }
+    }
   }
 }))

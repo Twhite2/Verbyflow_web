@@ -19,11 +19,17 @@ export default function ChatInterface() {
     findPartner,
     disconnect,
     toggleRecording,
-    sendAudioChunk
+    sendAudioChunk,
+    loadVoiceSample
   } = useConnectionStore()
   
   const audioRecorderRef = useRef<AudioRecorder | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  
+  // Load voice sample from localStorage on mount (client-side only)
+  useEffect(() => {
+    loadVoiceSample()
+  }, [loadVoiceSample])
   
   // Initialize audio recorder
   useEffect(() => {
