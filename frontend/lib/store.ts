@@ -69,6 +69,13 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       ws.onopen = () => {
         console.log('WebSocket connected')
         set({ status: 'connected', userId, ws })
+        
+        // Auto-send stored voice sample if available
+        const storedSample = get().storedVoiceSample
+        if (storedSample) {
+          console.log('Auto-sending stored voice sample on reconnect')
+          get().sendVoiceSample(storedSample)
+        }
       }
       
       ws.onmessage = (event) => {
@@ -264,9 +271,14 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
         status: 'disconnected', 
         ws: null, 
         partnerId: null, 
-        messages: [],
-        voiceSampleCaptured: false  // Reset voice sample on language change
+        messages: []
+        // Keep voiceSampleCaptured and storedVoiceSample - no need to recapture!
       })
+      
+      // Auto-reconnect with new language after a short delay
+      setTimeout(() => {
+        get().initialize()
+      }, 500)
     }
   },
   
