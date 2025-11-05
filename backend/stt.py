@@ -1,131 +1,156 @@
 """
-Speech-to-Text module using Whisper
+Speech-to-Text module using Faster-Whisper
+Provides 4x faster transcription with built-in VAD
 """
+
 import base64
-import io
 import logging
-import torch
-import whisper
 import numpy as np
 from typing import Optional
+from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
 
 # Global model instance (loaded once)
-_whisper_model: Optional[whisper.Whisper] = None
+_whisper_model: Optional[WhisperModel] = None
 
 
 def load_whisper_model(model_size: str = "base"):
     """
-    Load Whisper model into memory
-    
+    Load Faster-Whisper model into memory with GPU support
+
     Args:
         model_size: One of 'tiny', 'base', 'small', 'medium', 'large'
     """
     global _whisper_model
-    
+
     if _whisper_model is None:
-        logger.info(f"Loading Whisper model: {model_size}")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _whisper_model = whisper.load_model(model_size, device=device)
-        logger.info(f"Whisper model loaded on {device}")
-    
+        logger.info(f"Loading Faster-Whisper model: {model_size}")
+
+        try:
+            # Check if CUDA is available
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            if device == "cuda":
+                # Use int8 quantization for 4x less VRAM, same accuracy
+                compute_type = "int8_float16"
+                logger.info(f"Using GPU with int8 quantization")
+            else:
+                compute_type = "int8"
+                logger.info(f"Using CPU with int8")
+
+            _whisper_model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+                num_workers=4  # Parallel processing
+            )
+
+            logger.info(f"Faster-Whisper model loaded on {device} with {compute_type}")
+        except Exception as e:
+            logger.error(f"Failed to load Faster-Whisper model: {e}")
+            raise
+
     return _whisper_model
 
 
 async def process_audio_to_text(audio_base64: str, language: Optional[str] = None) -> str:
     """
-    Convert audio to text using Whisper with Voice Activity Detection
-    
+    Convert audio to text using Faster-Whisper with built-in VAD
+
     Args:
         audio_base64: Base64 encoded audio data (raw 16-bit PCM at 16kHz)
         language: Optional language hint (e.g., 'en', 'es', 'fr')
-        
+
     Returns:
         Transcribed text (empty if no speech detected)
     """
     try:
         # Load model if not already loaded
         model = load_whisper_model()
-        
+
         # Decode base64 audio
         audio_bytes = base64.b64decode(audio_base64)
-        
+
         # Check if audio is too small (less than 0.5 seconds at 16kHz)
         if len(audio_bytes) < 16000:  # 16000 samples/sec * 2 bytes/sample * 0.5 sec
             return ""
-        
+
         # Convert bytes to numpy array (16-bit PCM)
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-        
-        # VOICE ACTIVITY DETECTION: Check if audio has sufficient energy
-        # Calculate RMS (Root Mean Square) energy
-        audio_rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
-        
-        # Silence threshold (adjust based on your microphone)
-        SILENCE_THRESHOLD = 500  # Typical speech is 1000-5000+
-        
-        if audio_rms < SILENCE_THRESHOLD:
-            logger.debug(f"Audio too quiet (RMS: {audio_rms:.0f}), skipping transcription")
-            return ""
-        
+
         # Normalize to float32 between -1 and 1
         audio_float = audio_array.astype(np.float32) / 32768.0
-        
-        # Transcribe with Whisper - with hallucination reduction
-        result = model.transcribe(
+
+        # Transcribe with Faster-Whisper's built-in VAD
+        # This automatically filters silence and prevents hallucinations!
+        segments, info = model.transcribe(
             audio_float,
             language=language,
-            fp16=torch.cuda.is_available(),
+            vad_filter=True,  # KEY: Built-in VAD filters silence automatically!
+            vad_parameters=dict(
+                min_silence_duration_ms=500,  # Filter silence longer than 500ms
+                speech_pad_ms=400,  # Padding around speech segments
+                threshold=0.5  # VAD threshold (0.0-1.0)
+            ),
             condition_on_previous_text=False,  # Reduce hallucinations
-            temperature=0.0,  # More deterministic, less hallucination
+            temperature=0.0,  # More deterministic
+            beam_size=1,  # Faster for real-time (greedy decoding)
+            best_of=1,  # Faster
             compression_ratio_threshold=2.4,  # Filter repetitive text
-            logprob_threshold=-1.0,  # Filter low-confidence
-            no_speech_threshold=0.6  # Higher = more strict silence detection
+            log_prob_threshold=-1.0,  # Filter low-confidence
+            no_speech_threshold=0.6  # Strict silence detection
         )
-        
-        transcribed_text = result["text"].strip()
-        
-        # Additional filters for hallucinations
-        # Check if transcription is suspiciously repetitive
+
+        # Combine all segments into text
+        # segments is a generator, so we iterate and collect
+        transcribed_segments = []
+        for segment in segments:
+            text = segment.text.strip()
+            if text:
+                transcribed_segments.append(text)
+
+        transcribed_text = " ".join(transcribed_segments).strip()
+
+        # Additional filter: Check for repetitive hallucinations
         if transcribed_text:
             words = transcribed_text.lower().split()
             if len(words) > 3:
-                # Check for excessive repetition (hallucination indicator)
+                # Check for excessive repetition
                 unique_ratio = len(set(words)) / len(words)
                 if unique_ratio < 0.5:  # More than 50% repeated words
                     logger.debug(f"Detected repetitive text (hallucination), skipping: '{transcribed_text}'")
                     return ""
-            
-            # Check average log probability (confidence)
-            avg_logprob = result.get("avg_logprob", 0)
-            if avg_logprob < -1.0:  # Very low confidence
-                logger.debug(f"Low confidence transcription (logprob: {avg_logprob:.2f}), skipping: '{transcribed_text}'")
-                return ""
-        
-        # Only return if there's actual content
-        if transcribed_text and len(transcribed_text) > 0:
-            logger.info(f"Transcribed: '{transcribed_text}' (lang: {language}, RMS: {audio_rms:.0f})")
+
+        # Log and return
+        if transcribed_text:
+            logger.info(f"Transcribed: '{transcribed_text}' (lang: {info.language}, duration: {info.duration:.1f}s)")
             return transcribed_text
         else:
+            logger.debug(f"No speech detected in audio")
             return ""
-        
+
     except Exception as e:
         logger.error(f"STT Error: {e}")
         return ""
 
 
-def transcribe_file(audio_path: str, language: Optional[str] = None) -> dict:
+def transcribe_file(audio_path: str, language: Optional[str] = None) -> list:
     """
     Transcribe an audio file (for testing)
-    
+
     Args:
         audio_path: Path to audio file
         language: Optional language code
-        
+
     Returns:
-        Full Whisper result dict
+        List of transcribed segments
     """
     model = load_whisper_model()
-    result = model.transcribe(audio_path, language=language)
-    return result
+    segments, info = model.transcribe(
+        audio_path,
+        language=language,
+        vad_filter=True
+    )
+    return list(segments)
