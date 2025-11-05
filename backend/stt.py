@@ -35,14 +35,14 @@ def load_whisper_model(model_size: str = "base"):
 
 async def process_audio_to_text(audio_base64: str, language: Optional[str] = None) -> str:
     """
-    Convert audio to text using Whisper
+    Convert audio to text using Whisper with Voice Activity Detection
     
     Args:
         audio_base64: Base64 encoded audio data (raw 16-bit PCM at 16kHz)
         language: Optional language hint (e.g., 'en', 'es', 'fr')
         
     Returns:
-        Transcribed text
+        Transcribed text (empty if no speech detected)
     """
     try:
         # Load model if not already loaded
@@ -58,21 +58,54 @@ async def process_audio_to_text(audio_base64: str, language: Optional[str] = Non
         # Convert bytes to numpy array (16-bit PCM)
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
         
+        # VOICE ACTIVITY DETECTION: Check if audio has sufficient energy
+        # Calculate RMS (Root Mean Square) energy
+        audio_rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+        
+        # Silence threshold (adjust based on your microphone)
+        SILENCE_THRESHOLD = 500  # Typical speech is 1000-5000+
+        
+        if audio_rms < SILENCE_THRESHOLD:
+            logger.debug(f"Audio too quiet (RMS: {audio_rms:.0f}), skipping transcription")
+            return ""
+        
         # Normalize to float32 between -1 and 1
         audio_float = audio_array.astype(np.float32) / 32768.0
         
-        # Transcribe with Whisper
+        # Transcribe with Whisper - with hallucination reduction
         result = model.transcribe(
             audio_float,
             language=language,
-            fp16=torch.cuda.is_available()
+            fp16=torch.cuda.is_available(),
+            condition_on_previous_text=False,  # Reduce hallucinations
+            temperature=0.0,  # More deterministic, less hallucination
+            compression_ratio_threshold=2.4,  # Filter repetitive text
+            logprob_threshold=-1.0,  # Filter low-confidence
+            no_speech_threshold=0.6  # Higher = more strict silence detection
         )
         
         transcribed_text = result["text"].strip()
         
-        # Only return if there's actual content (not just silence markers)
+        # Additional filters for hallucinations
+        # Check if transcription is suspiciously repetitive
+        if transcribed_text:
+            words = transcribed_text.lower().split()
+            if len(words) > 3:
+                # Check for excessive repetition (hallucination indicator)
+                unique_ratio = len(set(words)) / len(words)
+                if unique_ratio < 0.5:  # More than 50% repeated words
+                    logger.debug(f"Detected repetitive text (hallucination), skipping: '{transcribed_text}'")
+                    return ""
+            
+            # Check average log probability (confidence)
+            avg_logprob = result.get("avg_logprob", 0)
+            if avg_logprob < -1.0:  # Very low confidence
+                logger.debug(f"Low confidence transcription (logprob: {avg_logprob:.2f}), skipping: '{transcribed_text}'")
+                return ""
+        
+        # Only return if there's actual content
         if transcribed_text and len(transcribed_text) > 0:
-            logger.info(f"Transcribed: '{transcribed_text}' (lang: {language})")
+            logger.info(f"Transcribed: '{transcribed_text}' (lang: {language}, RMS: {audio_rms:.0f})")
             return transcribed_text
         else:
             return ""
