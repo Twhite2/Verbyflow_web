@@ -68,12 +68,13 @@ def load_whisper_model(model_size: str = "base"):
         _vad_gate = VADGate(
             silence_threshold=0.01,  # RMS threshold
             min_speech_duration_ms=300,  # Skip very short speech
-            max_pause_duration_ms=1500,  # Natural pause tolerance (1.5s)
-            trailing_silence_ms=500,  # Keep 0.5s audio before speech
+            max_pause_duration_ms=800,  # Faster response (was 1500ms)
+            trailing_silence_ms=300,  # Less trailing (was 500ms)
             prolonged_silence_threshold_ms=8000,  # Reset context after 8s
-            token_confidence_threshold=0.4  # Filter low confidence tokens
+            token_confidence_threshold=0.4,  # Filter low confidence tokens
+            max_speech_duration_ms=4000  # Send chunks every 4s during continuous speech
         )
-        logger.info("✅ VAD Gate initialized with soft pause")
+        logger.info("✅ VAD Gate initialized with soft pause (optimized for speed)")
 
     return _whisper_model
 
@@ -113,8 +114,8 @@ async def process_audio_to_text(audio_base64: str, language: Optional[str] = Non
         current_time_ms = int(time.time() * 1000)
         audio_to_transcribe, state = _vad_gate.process_chunk(audio_float, current_time_ms)
         
-        # Only transcribe when speech segment ends (soft pause gate)
-        if state == "speech_ended" and audio_to_transcribe is not None:
+        # Transcribe when speech segment ends OR intermediate chunk during continuous speech
+        if (state == "speech_ended" or state == "intermediate_chunk") and audio_to_transcribe is not None:
             logger.debug(f"📤 Transcribing speech segment ({len(audio_to_transcribe)} samples)")
             
             # Check if context reset is needed (prolonged silence > 8s)

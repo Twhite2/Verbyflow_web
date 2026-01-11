@@ -7,15 +7,18 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import logging
 import asyncio
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from sockets import router as socket_router
+from logging_config import setup_logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Configure logging with file output
+log_filename = setup_logging()
 logger = logging.getLogger(__name__)
+logger.info(f"📝 Backend logs saved to: {log_filename}")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -27,29 +30,19 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup_event():
     """
-    Preload AI models at startup to avoid delays on first request
+    Preload ALL AI models at startup to eliminate first-call latency
+    Includes: Whisper, MarianMT (en-es, es-en), XTTS-v2
     """
-    logger.info("🚀 Preloading AI models...")
+    logger.info("🚀 Preloading all AI models (Whisper, MarianMT, XTTS)...")
     
-    # Import model loaders
-    from stt import load_whisper_model
-    from tts import load_tts_model
+    from model_loader import preload_all_models
     
-    # Load models in parallel
-    def load_whisper():
-        load_whisper_model()
-    
-    def load_tts():
-        load_tts_model()
-    
-    # Run in thread pool to avoid blocking
-    loop = asyncio.get_event_loop()
-    await asyncio.gather(
-        loop.run_in_executor(None, load_whisper),
-        loop.run_in_executor(None, load_tts)
-    )
-    
-    logger.info("✅ All AI models preloaded and ready!")
+    try:
+        await preload_all_models()
+        logger.info("✅ All AI models preloaded and ready!")
+    except Exception as e:
+        logger.error(f"Model preload failed: {e}", exc_info=True)
+        logger.warning("⚠️ Server will continue but first calls may be slow")
 
 # CORS Configuration
 app.add_middleware(

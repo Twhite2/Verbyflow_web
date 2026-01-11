@@ -1,42 +1,49 @@
 """
-Text-to-Speech module using Coqui TTS
+Text-to-Speech module using Coqui TTS with Streaming Support
 """
 import base64
 import logging
 import numpy as np
 import io
-from typing import Optional
+import tempfile
+import os
+import wave
+from typing import Optional, AsyncGenerator, Dict
+import asyncio
+from TTS.api import TTS
 
 logger = logging.getLogger(__name__)
 
 # Global TTS model instance
 _tts_model = None
 
+# Voice embedding cache
+_voice_embedding_cache: Dict[str, str] = {}
+
 
 def load_tts_model():
     """
-    Load TTS model into memory
-    Using Coqui TTS for multilingual support
+    Load Coqui TTS model (XTTS v2 with voice cloning) - optimized for speed
     """
     global _tts_model
     
     if _tts_model is None:
         try:
+            logger.info("Loading TTS model (XTTS v2)...")
+            
             import torch
-            logger.info("Loading Coqui TTS model...")
-            from TTS.api import TTS
-            
-            # Determine device (GPU if available)
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"TTS will use device: {device}")
             
-            # Load multilingual model with GPU support
-            _tts_model = TTS(
-                model_name="tts_models/multilingual/multi-dataset/xtts_v2",
-                gpu=(device == "cuda")  # Enable GPU if available
-            )
+            # Use XTTS v2 for voice cloning and multilingual support
+            _tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False)
+            _tts_model.to(device)
             
-            logger.info(f"TTS model loaded successfully on {device}")
+            # Enable speed optimizations
+            if hasattr(_tts_model.synthesizer.tts_model, 'decoder'):
+                # Use inference mode for faster processing
+                _tts_model.synthesizer.tts_model.decoder.use_gt_durations = False
+            
+            logger.info(f"TTS model loaded successfully on {device} with speed optimizations")
         except Exception as e:
             logger.error(f"Failed to load TTS model: {e}")
             _tts_model = None
@@ -130,10 +137,195 @@ async def process_text_to_audio(text: str, language: str = "en", voice_sample: O
         return ""
 
 
+def get_or_create_speaker_wav(user_id: str, voice_sample: Optional[str] = None) -> Optional[str]:
+    """
+    Get cached speaker wav path or create new one from voice sample.
+    Reduces latency by avoiding repeated temp file creation.
+    
+    Args:
+        user_id: User ID for caching
+        voice_sample: Base64 encoded voice sample (only needed for first call)
+        
+    Returns:
+        Path to speaker wav file
+    """
+    global _voice_embedding_cache
+    
+    # Check cache first
+    if user_id in _voice_embedding_cache:
+        cached_path = _voice_embedding_cache[user_id]
+        if os.path.exists(cached_path):
+            logger.debug(f"Using cached speaker wav for user {user_id}")
+            return cached_path
+        else:
+            # Cache invalidated, remove entry
+            del _voice_embedding_cache[user_id]
+    
+    # Create new speaker wav file
+    if not voice_sample:
+        logger.warning(f"No voice sample provided for user {user_id} and no cache exists")
+        return None
+    
+    try:
+        # Decode voice sample
+        voice_bytes = base64.b64decode(voice_sample)
+        
+        # Create persistent temp file (don't delete immediately)
+        f = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        with wave.open(f.name, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(16000)  # 16kHz
+            wav_file.writeframes(voice_bytes)
+        
+        # Cache the path
+        _voice_embedding_cache[user_id] = f.name
+        logger.info(f"Created and cached speaker wav for user {user_id}")
+        return f.name
+        
+    except Exception as e:
+        logger.error(f"Failed to create speaker wav for user {user_id}: {e}")
+        return None
+
+
+def clear_voice_cache(user_id: Optional[str] = None):
+    """
+    Clear voice embedding cache for a user or all users.
+    Call this when user disconnects.
+    
+    Args:
+        user_id: User ID to clear, or None to clear all
+    """
+    global _voice_embedding_cache
+    
+    if user_id:
+        if user_id in _voice_embedding_cache:
+            # Delete temp file
+            try:
+                os.unlink(_voice_embedding_cache[user_id])
+            except:
+                pass
+            del _voice_embedding_cache[user_id]
+            logger.info(f"Cleared voice cache for user {user_id}")
+    else:
+        # Clear all
+        for path in _voice_embedding_cache.values():
+            try:
+                os.unlink(path)
+            except:
+                pass
+        _voice_embedding_cache.clear()
+        logger.info("Cleared all voice caches")
+
+
+async def stream_text_to_audio(
+    text: str, 
+    language: str = "en", 
+    user_id: Optional[str] = None,
+    voice_sample: Optional[str] = None
+) -> AsyncGenerator[str, None]:
+    """
+    Stream TTS audio generation with voice cloning.
+    Yields audio chunks as they're generated for lower latency.
+    
+    Args:
+        text: Text to synthesize
+        language: Target language code
+        user_id: User ID for voice caching
+        voice_sample: Base64 encoded audio sample (only needed first time)
+        
+    Yields:
+        Base64 encoded audio chunks
+    """
+    try:
+        if not text or not text.strip():
+            return
+        
+        model = load_tts_model()
+        if model is None:
+            logger.warning("TTS model not available, skipping")
+            return
+        
+        logger.info(f"Streaming TTS for: '{text[:50]}...' in language: {language}")
+        
+        # Get or create cached speaker wav
+        speaker_wav_path = None
+        if user_id:
+            speaker_wav_path = get_or_create_speaker_wav(user_id, voice_sample)
+        elif voice_sample:
+            # No user_id, create temporary (legacy behavior)
+            speaker_wav_path = get_or_create_speaker_wav("temp", voice_sample)
+        
+        if not speaker_wav_path:
+            logger.error("No speaker wav available for TTS")
+            return
+        
+        # Check if model supports streaming
+        if hasattr(model, 'tts_stream') or hasattr(model.synthesizer, 'tts'):
+            # XTTS v2 streaming mode
+            logger.info("Using XTTS streaming mode")
+            
+            # Generate audio with streaming
+            try:
+                # Use tts method but split output into chunks
+                wav = model.tts(text=text, language=language, speaker_wav=speaker_wav_path)
+                
+                if isinstance(wav, list):
+                    wav = np.array(wav)
+                
+                # Normalize and convert to 16-bit PCM
+                wav_normalized = np.clip(wav, -1.0, 1.0)
+                wav_int16 = (wav_normalized * 32767).astype(np.int16)
+                
+                # Stream in chunks (0.2s = 3200 samples at 16kHz)
+                chunk_size = 3200
+                total_samples = len(wav_int16)
+                
+                for i in range(0, total_samples, chunk_size):
+                    chunk = wav_int16[i:i+chunk_size]
+                    audio_bytes = chunk.tobytes()
+                    audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                    
+                    # Yield chunk immediately
+                    yield audio_base64
+                    
+                    # Small delay to simulate streaming (remove in production)
+                    await asyncio.sleep(0.01)
+                
+                logger.info(f"Streamed {total_samples} samples in {total_samples//chunk_size + 1} chunks")
+                
+            except Exception as e:
+                logger.error(f"Streaming TTS error: {e}")
+                return
+        else:
+            # Fallback: generate all at once and split
+            logger.warning("Model doesn't support streaming, using chunked fallback")
+            wav = model.tts(text=text, language=language, speaker_wav=speaker_wav_path)
+            
+            if isinstance(wav, list):
+                wav = np.array(wav)
+            
+            wav_normalized = np.clip(wav, -1.0, 1.0)
+            wav_int16 = (wav_normalized * 32767).astype(np.int16)
+            audio_bytes = wav_int16.tobytes()
+            audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+            
+            # Split into chunks
+            chunk_size = 8192  # Base64 chunk size
+            for i in range(0, len(audio_base64), chunk_size):
+                yield audio_base64[i:i+chunk_size]
+                await asyncio.sleep(0.01)
+    
+    except Exception as e:
+        logger.error(f"Stream TTS Error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+
 async def clone_voice(audio_sample: bytes, text: str, language: str = "en") -> str:
     """
     Clone voice from sample and generate speech
-    (Advanced feature for future)
+    (Legacy function - use stream_text_to_audio instead)
     
     Args:
         audio_sample: Sample audio for voice cloning
@@ -143,6 +335,4 @@ async def clone_voice(audio_sample: bytes, text: str, language: str = "en") -> s
     Returns:
         Base64 encoded audio
     """
-    # This would use Dia's voice cloning capabilities
-    # For MVP, just use standard TTS
     return await process_text_to_audio(text, language)

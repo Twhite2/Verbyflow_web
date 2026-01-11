@@ -25,11 +25,13 @@ class VADGate:
         trailing_silence_ms: int = 500,  # Keep this much audio before speech
         prolonged_silence_threshold_ms: int = 8000,  # Reset context after this
         token_confidence_threshold: float = 0.4,  # Reject low-confidence tokens
+        max_speech_duration_ms: int = 5000,  # Max continuous speech before sending
         sample_rate: int = 16000
     ):
         self.silence_threshold = silence_threshold
         self.min_speech_duration_ms = min_speech_duration_ms
         self.max_pause_duration_ms = max_pause_duration_ms
+        self.max_speech_duration_ms = max_speech_duration_ms
         self.trailing_silence_ms = trailing_silence_ms
         self.prolonged_silence_threshold_ms = prolonged_silence_threshold_ms
         self.token_confidence_threshold = token_confidence_threshold
@@ -116,6 +118,21 @@ class VADGate:
             else:
                 # Continue speaking
                 self.speech_buffer.append(audio_chunk)
+                
+                # Check if continuous speech is too long - send intermediate chunk
+                speech_duration_ms = current_time_ms - self.speech_start_time
+                if speech_duration_ms >= self.max_speech_duration_ms:
+                    logger.debug(f"⚡ Max speech duration reached ({speech_duration_ms}ms), sending intermediate chunk")
+                    
+                    if len(self.speech_buffer) > 0:
+                        audio_to_transcribe = np.concatenate(self.speech_buffer)
+                        self.speech_buffer = []
+                        
+                        # Reset start time but keep speaking state
+                        self.speech_start_time = current_time_ms
+                        
+                        return audio_to_transcribe, "intermediate_chunk"
+                
                 return None, "speaking"
         
         else:

@@ -31,6 +31,14 @@ interface ConnectionState {
   // WebSocket
   ws: WebSocket | null
   
+  // WebRTC callbacks (set by VideoCallInterface)
+  onWebRTCOffer?: (offer: RTCSessionDescriptionInit, fromUser: string) => void
+  onWebRTCAnswer?: (answer: RTCSessionDescriptionInit, fromUser: string) => void
+  onWebRTCIceCandidate?: (candidate: RTCIceCandidateInit, fromUser: string) => void
+  
+  // Text chat state
+  isPartnerTyping: boolean
+  
   // Actions
   initialize: () => void
   setLanguage: (lang: string) => void
@@ -42,6 +50,16 @@ interface ConnectionState {
   addMessage: (message: Omit<Message, 'id' | 'timestamp'>) => void
   toggleRecording: () => void
   loadVoiceSample: () => void
+  sendWebRTCOffer: (offer: RTCSessionDescriptionInit) => void
+  sendWebRTCAnswer: (answer: RTCSessionDescriptionInit) => void
+  sendWebRTCIceCandidate: (candidate: RTCIceCandidateInit) => void
+  setWebRTCCallbacks: (callbacks: {
+    onWebRTCOffer?: (offer: RTCSessionDescriptionInit, fromUser: string) => void
+    onWebRTCAnswer?: (answer: RTCSessionDescriptionInit, fromUser: string) => void
+    onWebRTCIceCandidate?: (candidate: RTCIceCandidateInit, fromUser: string) => void
+  }) => void
+  sendTextMessage: (text: string) => void
+  sendTypingIndicator: (isTyping: boolean) => void
 }
 
 export const useConnectionStore = create<ConnectionState>((set, get) => ({
@@ -57,13 +75,22 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   isCapturingVoice: false,
   storedVoiceSample: null,
   ws: null,
+  isPartnerTyping: false,
   
   // Initialize connection
   initialize: () => {
+    // Prevent duplicate connections
+    const currentWs = get().ws
+    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+      console.log('WebSocket already connected, skipping initialization')
+      return
+    }
+    
     const userId = `user_${Math.random().toString(36).substr(2, 9)}`
     const wsUrl = `ws://localhost:8000/ws/${userId}?lang=${get().language}`
     
     try {
+      set({ status: 'connecting' })  // Set to connecting immediately
       const ws = new WebSocket(wsUrl)
       
       ws.onopen = () => {
@@ -122,6 +149,33 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             })
             break
             
+          case 'partial_transcript':
+            // Real-time partial transcript (UI only, not translated)
+            console.log('💬 Partial transcript:', data.text)
+            // Store in state or display - handled by component
+            break
+          
+          case 'audio_chunk':
+            // TTS audio chunk from backend (translated speech)
+            console.log('🔊 Audio chunk received:', {
+              hasAudio: !!data.audio,
+              audioLength: data.audio?.length,
+              playbackExists: !!(window as any).audioPlayback
+            })
+            if (data.audio) {
+              // Forward to AudioPlayback component
+              const audioPlayback = (window as any).audioPlayback
+              if (audioPlayback) {
+                console.log('✅ Enqueuing chunk to AudioPlayback')
+                audioPlayback.enqueueChunk(data.audio)
+              } else {
+                console.error('❌ AudioPlayback not found on window object!')
+              }
+            } else {
+              console.warn('⚠️ No audio data in chunk')
+            }
+            break
+          
           case 'direct_audio':
             // Direct voice chat mode - same language, no translation
             console.log('🎙️ Direct audio received (same language mode)')
@@ -237,6 +291,146 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             }
             break
             
+          case 'webrtc_offer':
+            console.log('📹 WebRTC offer received from partner')
+            if (get().onWebRTCOffer) {
+              get().onWebRTCOffer!(data.offer, data.from_user)
+            }
+            break
+            
+          case 'webrtc_answer':
+            console.log('📹 WebRTC answer received from partner')
+            if (get().onWebRTCAnswer) {
+              get().onWebRTCAnswer!(data.answer, data.from_user)
+            }
+            break
+            
+          case 'webrtc_ice_candidate':
+            console.log('🧊 ICE candidate received from partner')
+            if (get().onWebRTCIceCandidate) {
+              get().onWebRTCIceCandidate!(data.candidate, data.from_user)
+            }
+            break
+            
+          case 'audio_chunk_stream':
+            console.log('🎵 Audio chunk received:', data.chunk_number)
+            
+            // Add message on first chunk
+            if (data.chunk_number === 1 && data.text) {
+              get().addMessage({
+                text: data.text,
+                originalText: data.original_text,
+                isOwn: false,
+                hasAudio: true
+              })
+            }
+            
+            // Play audio chunk immediately
+            if (data.audio && data.audio.length > 0) {
+              try {
+                const binaryString = atob(data.audio)
+                const bytes = new Uint8Array(binaryString.length)
+                for (let i = 0; i < binaryString.length; i++) {
+                  bytes[i] = binaryString.charCodeAt(i)
+                }
+                
+                // Create audio context (reuse if exists)
+                const audioContext = new AudioContext()
+                const sampleRate = 24000
+                
+                // Convert PCM to AudioBuffer
+                const numSamples = bytes.length / 2
+                const audioBuffer = audioContext.createBuffer(1, numSamples, sampleRate)
+                const channelData = audioBuffer.getChannelData(0)
+                
+                const view = new DataView(bytes.buffer)
+                for (let i = 0; i < numSamples; i++) {
+                  const int16 = view.getInt16(i * 2, true)
+                  channelData[i] = int16 / 32768.0
+                }
+                
+                // Play immediately
+                const source = audioContext.createBufferSource()
+                source.buffer = audioBuffer
+                source.connect(audioContext.destination)
+                source.start(0)
+                
+                console.log(`🔊 Playing chunk ${data.chunk_number} (${audioBuffer.duration.toFixed(2)}s)`)
+              } catch (error) {
+                console.error('❌ Failed to play audio chunk:', error)
+              }
+            }
+            break
+            
+          case 'audio_stream_complete':
+            console.log('✅ Audio stream complete:', data.total_chunks, 'chunks')
+            break
+            
+          case 'translation_result':
+            console.log('🌐 Translation result received:', data.translation)
+            
+            // Add translated message to chat
+            get().addMessage({
+              text: data.translation,
+              originalText: data.transcription,
+              isOwn: false,
+              hasAudio: true
+            })
+            
+            // Play TTS audio
+            if (data.audio && data.audio.length > 0) {
+              try {
+                const binaryString = atob(data.audio)
+                const bytes = new Uint8Array(binaryString.length)
+                for (let i = 0; i < binaryString.length; i++) {
+                  bytes[i] = binaryString.charCodeAt(i)
+                }
+                
+                const audioContext = new AudioContext()
+                const sampleRate = 24000 // XTTS output
+                
+                // Convert PCM to AudioBuffer
+                const numSamples = bytes.length / 2
+                const audioBuffer = audioContext.createBuffer(1, numSamples, sampleRate)
+                const channelData = audioBuffer.getChannelData(0)
+                
+                const view = new DataView(bytes.buffer)
+                for (let i = 0; i < numSamples; i++) {
+                  const int16 = view.getInt16(i * 2, true)
+                  channelData[i] = int16 / 32768.0
+                }
+                
+                // Play audio
+                const source = audioContext.createBufferSource()
+                source.buffer = audioBuffer
+                source.connect(audioContext.destination)
+                source.start(0)
+                
+                console.log(`🔊 Playing TTS translation (${audioBuffer.duration.toFixed(2)}s)`)
+              } catch (error) {
+                console.error('❌ Failed to play TTS audio:', error)
+              }
+            }
+            break
+            
+          case 'text_message_received':
+            console.log('💬 Text message received:', data.text)
+            get().addMessage({
+              text: data.text,
+              originalText: data.original_text,
+              isOwn: false
+            })
+            break
+            
+          case 'text_message_sent':
+            console.log('✅ Text message sent confirmation')
+            // Message already added locally when sent
+            break
+            
+          case 'partner_typing':
+            set({ isPartnerTyping: data.is_typing })
+            break
+            
           case 'error':
             console.error('Server error:', data.message)
             break
@@ -286,16 +480,26 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   findPartner: () => {
     const { ws, status } = get()
     
-    if (status === 'disconnected') {
+    console.log('🔍 findPartner called - status:', status, 'ws readyState:', ws?.readyState)
+    
+    if (status === 'disconnected' || status === 'connecting') {
+      console.log('Not connected yet, initializing...')
       get().initialize()
       // Wait a bit then find partner
-      setTimeout(() => get().findPartner(), 1000)
+      setTimeout(() => get().findPartner(), 1500)
       return
     }
     
     if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log('✅ Sending find_partner message to backend')
       ws.send(JSON.stringify({ type: 'find_partner' }))
       set({ status: 'searching' })
+    } else {
+      console.error('❌ Cannot send find_partner - WebSocket not ready:', {
+        hasWs: !!ws,
+        readyState: ws?.readyState,
+        status
+      })
     }
   },
   
@@ -436,6 +640,92 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
         })
         console.log('Voice sample loaded from localStorage')
       }
+    }
+  },
+  
+  // WebRTC methods
+  sendWebRTCOffer: (offer) => {
+    const { ws } = get()
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log('📹 Sending WebRTC offer')
+      ws.send(JSON.stringify({
+        type: 'webrtc_offer',
+        offer
+      }))
+    }
+  },
+  
+  sendWebRTCAnswer: (answer) => {
+    const { ws } = get()
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log('📹 Sending WebRTC answer')
+      ws.send(JSON.stringify({
+        type: 'webrtc_answer',
+        answer
+      }))
+    }
+  },
+  
+  sendWebRTCIceCandidate: (candidate) => {
+    const { ws } = get()
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log('🧊 Sending ICE candidate')
+      ws.send(JSON.stringify({
+        type: 'webrtc_ice_candidate',
+        candidate
+      }))
+    }
+  },
+  
+  setWebRTCCallbacks: (callbacks) => {
+    set({
+      onWebRTCOffer: callbacks.onWebRTCOffer,
+      onWebRTCAnswer: callbacks.onWebRTCAnswer,
+      onWebRTCIceCandidate: callbacks.onWebRTCIceCandidate
+    })
+  },
+  
+  // Text chat methods
+  sendTextMessage: (text) => {
+    const { ws, status } = get()
+    
+    if (status !== 'paired') {
+      console.warn('Cannot send text message - not paired')
+      return
+    }
+    
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const messageId = `msg_${Date.now()}_${Math.random()}`
+      const timestamp = new Date().toISOString()
+      
+      console.log('💬 Sending text message:', text)
+      ws.send(JSON.stringify({
+        type: 'text_message',
+        text,
+        message_id: messageId,
+        timestamp
+      }))
+      
+      // Add message to local store immediately
+      get().addMessage({
+        text,
+        isOwn: true
+      })
+    } else {
+      console.error('Cannot send text message - WebSocket not ready')
+    }
+  },
+  
+  sendTypingIndicator: (isTyping) => {
+    const { ws, status } = get()
+    
+    if (status !== 'paired') return
+    
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'typing_indicator',
+        is_typing: isTyping
+      }))
     }
   }
 }))

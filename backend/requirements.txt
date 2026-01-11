@@ -8,7 +8,10 @@ pydantic-settings==2.1.0
 # AI/ML Dependencies
 torch>=2.2.0
 torchaudio>=2.2.0
-faster-whisper>=1.0.0
+# faster-whisper>=1.0.0  # REMOVED - Had hallucination issues
+# vosk>=0.3.45  # Replaced with Deepgram for real-time, low-latency STT
+deepgram-sdk>=3.2.0  # Real-time STT API - ~$0.26/hour
+python-dotenv>=1.0.0  # For .env file
 transformers>=4.36.2
 sentencepiece>=0.1.99
 protobuf>=4.25.2

@@ -1,12 +1,22 @@
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { Inter, Outfit } from 'next/font/google'
 import './globals.css'
 
-const inter = Inter({ subsets: ['latin'] })
+const inter = Inter({ 
+  subsets: ['latin'],
+  variable: '--font-inter',
+  display: 'swap',
+})
+
+const outfit = Outfit({ 
+  subsets: ['latin'],
+  variable: '--font-outfit',
+  display: 'swap',
+})
 
 export const metadata: Metadata = {
-  title: 'VerbyFlow - Connect Beyond Language',
-  description: 'Anonymous voice chat with real-time translation',
+  title: 'VerbyFlow - Connect Beyond Language Barriers',
+  description: 'Multi-mode communication platform with real-time translation - video, audio, and text chat',
 }
 
 export default function RootLayout({
@@ -16,7 +26,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className={inter.className}>{children}</body>
+      <body className={`${inter.variable} ${outfit.variable} font-sans antialiased`}>{children}</body>
     </html>
   )
 }

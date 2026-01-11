@@ -37,7 +37,7 @@ export class AudioRecorder {
       source.connect(this.scriptProcessor)
       this.scriptProcessor.connect(this.audioContext.destination)
       
-      // Send audio chunks every 2 seconds
+      // Send audio chunks every 1 second for faster response
       this.intervalId = setInterval(() => {
         if (this.audioChunks.length > 0) {
           // Concatenate all chunks
@@ -49,28 +49,39 @@ export class AudioRecorder {
             offset += chunk.length
           }
           
-          // Convert float32 to int16 PCM
-          const int16 = new Int16Array(combined.length)
+          // Calculate RMS energy for basic VAD
+          let sum = 0
           for (let i = 0; i < combined.length; i++) {
-            const s = Math.max(-1, Math.min(1, combined[i]))
-            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+            sum += combined[i] * combined[i]
           }
+          const rms = Math.sqrt(sum / combined.length)
           
-          // Convert to base64 (process in chunks to avoid stack overflow)
-          const bytes = new Uint8Array(int16.buffer)
-          const chunkSize = 8192
-          let binaryString = ''
-          for (let i = 0; i < bytes.length; i += chunkSize) {
-            const chunk = bytes.slice(i, i + chunkSize)
-            binaryString += String.fromCharCode(...chunk)
+          // Only send if there's sufficient energy (basic silence filter)
+          // Backend VAD gate will do the heavy lifting
+          if (rms > 0.005) {  // Very low threshold, backend will refine
+            // Convert float32 to int16 PCM
+            const int16 = new Int16Array(combined.length)
+            for (let i = 0; i < combined.length; i++) {
+              const s = Math.max(-1, Math.min(1, combined[i]))
+              int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+            }
+            
+            // Convert to base64 (process in chunks to avoid stack overflow)
+            const bytes = new Uint8Array(int16.buffer)
+            const chunkSize = 8192
+            let binaryString = ''
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+              const chunk = bytes.slice(i, i + chunkSize)
+              binaryString += String.fromCharCode(...chunk)
+            }
+            const base64 = btoa(binaryString)
+            onDataAvailable(base64)
           }
-          const base64 = btoa(binaryString)
-          onDataAvailable(base64)
           
           // Clear chunks
           this.audioChunks = []
         }
-      }, 2000)
+      }, 1000)  // Faster: 1s instead of 2s
       
     } catch (error) {
       console.error('Failed to start recording:', error)

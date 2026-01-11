@@ -93,6 +93,7 @@ def load_translation_model(source_lang: str, target_lang: str):
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     """
     Translate text from source to target language
+    Optimized for text chat (<100ms target)
     
     Args:
         text: Text to translate
@@ -103,13 +104,38 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
         Translated text
     """
     try:
-        # If same language, return as-is
+        # If same language, return as-is (instant)
         if source_lang == target_lang:
             return text
         
-        # If text is empty, return as-is
+        # If text is empty, return as-is (instant)
         if not text or not text.strip():
             return text
+        
+        # Edge case: preserve emojis and URLs by extracting them
+        import re
+        
+        # Extract URLs (preserve them)
+        url_pattern = r'https?://[^\s]+'
+        urls = re.findall(url_pattern, text)
+        text_with_placeholders = text
+        for i, url in enumerate(urls):
+            text_with_placeholders = text_with_placeholders.replace(url, f"__URL{i}__")
+        
+        # Extract emojis (preserve them) - Unicode emoji ranges
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"  # emoticons
+            "\U0001F300-\U0001F5FF"  # symbols & pictographs
+            "\U0001F680-\U0001F6FF"  # transport & map symbols
+            "\U0001F1E0-\U0001F1FF"  # flags
+            "\U00002702-\U000027B0"
+            "\U000024C2-\U0001F251"
+            "]+", flags=re.UNICODE
+        )
+        emojis = emoji_pattern.findall(text_with_placeholders)
+        for i, emoji in enumerate(emojis):
+            text_with_placeholders = text_with_placeholders.replace(emoji, f"__EMOJI{i}__")
             
         logger.info(f"Translating: '{text[:50]}...' ({source_lang} -> {target_lang})")
         
@@ -120,20 +146,37 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
             logger.warning(f"Translation model not available for {source_lang}->{target_lang}, returning original")
             return text  # Fallback to original
         
-        # Tokenize input text
-        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        # Tokenize input text (max 128 tokens for chat messages - faster)
+        inputs = tokenizer(
+            text_with_placeholders, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=128  # Reduced for faster chat translation
+        )
         
         # Move to GPU if available
         import torch
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
-        # Generate translation
+        # Generate translation with optimized settings for speed
         with torch.no_grad():
-            translated_tokens = model.generate(**inputs, max_length=512)
+            translated_tokens = model.generate(
+                **inputs, 
+                max_length=128,  # Reduced for speed
+                num_beams=1,  # Greedy decoding (faster than beam search)
+                early_stopping=True
+            )
         
         # Decode output
         result = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+        
+        # Restore URLs and emojis
+        for i, url in enumerate(urls):
+            result = result.replace(f"__URL{i}__", url)
+        for i, emoji in enumerate(emojis):
+            result = result.replace(f"__EMOJI{i}__", emoji)
         
         logger.info(f"Translation result: '{result[:50]}...'")
         return result
