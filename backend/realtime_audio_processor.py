@@ -7,13 +7,20 @@ Complies with Master Spec: 20ms frames, continuous flow, silence as data
 import queue
 import threading
 import time
+from typing import Optional, Callable
 import logging
+
 import numpy as np
 import torch
-from typing import Optional, Callable, Dict
 from faster_whisper import WhisperModel
+import scipy.signal
+from vad_gate import HallucinationFilter
 
 logger = logging.getLogger(__name__)
+
+# Global shared Whisper model (CRITICAL: prevent OOM by sharing across users)
+_global_whisper_model: Optional[WhisperModel] = None
+_whisper_lock = threading.Lock()
 
 # Silero VAD
 try:
@@ -96,22 +103,36 @@ class RealtimeAudioProcessor:
     
     def _load_models(self):
         """Load Whisper and VAD models (blocking)"""
-        # Load Faster-Whisper
-        try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            compute_type = "int8_float16" if device == "cuda" else "int8"
+        global _global_whisper_model
+        
+        # CRITICAL: Use shared global Whisper model to prevent OOM
+        with _whisper_lock:
+            if _global_whisper_model is None:
+                try:
+                    # Clear GPU cache before loading
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        logger.info("🧹 Cleared GPU cache before loading shared Whisper")
+                    
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    compute_type = "int8_float16" if device == "cuda" else "int8"
+                    
+                    logger.info(f"Loading SHARED Whisper model on {device}...")
+                    _global_whisper_model = WhisperModel(
+                        "base",  # Fast model for streaming
+                        device=device,
+                        compute_type=compute_type,
+                        num_workers=2
+                    )
+                    logger.info(f"✅ SHARED Whisper loaded on {device} (prevents OOM)")
+                except Exception as e:
+                    logger.error(f"Failed to load Whisper: {e}")
+                    raise
+            else:
+                logger.info(f"♻️ Reusing existing shared Whisper model for {self.user_id}")
             
-            logger.info(f"Loading Whisper model on {device}...")
-            self.whisper_model = WhisperModel(
-                "base",  # Fast model for streaming
-                device=device,
-                compute_type=compute_type,
-                num_workers=2
-            )
-            logger.info(f"✅ Whisper loaded on {device}")
-        except Exception as e:
-            logger.error(f"Failed to load Whisper: {e}")
-            raise
+            # Reference the shared model
+            self.whisper_model = _global_whisper_model
         
         # Load VAD
         if SILERO_AVAILABLE:
@@ -226,25 +247,75 @@ class RealtimeAudioProcessor:
                 self._transcribe_async(timestamp)
                 self.audio_buffer = []
     
+    def _preprocess_audio(self, frame: np.ndarray) -> np.ndarray:
+        """Fast preprocessing - RMS gating only (no FFT to avoid 500ms bottleneck)"""
+        # Check RMS energy - if too low, zero it out
+        rms = np.sqrt(np.mean(frame ** 2))
+        if rms < 0.003:  # Adjusted threshold for better noise rejection
+            return np.zeros_like(frame).astype(np.float32)
+        
+        # Simple high-pass filter only (fast: <2ms)
+        sos = scipy.signal.butter(4, 80, 'hp', fs=16000, output='sos')
+        frame_filtered = scipy.signal.sosfilt(sos, frame)
+        
+        return frame_filtered.astype(np.float32)
+    
     def _compute_vad(self, frame: np.ndarray) -> bool:
-        """Compute VAD (speech/silence)"""
+        """Compute VAD (speech/silence) with preprocessing"""
+        # Preprocess before VAD to reduce noise impact
+        frame_clean = self._preprocess_audio(frame)
+        
         if self.vad_model is not None:
             # Silero VAD
             try:
-                frame_torch = torch.from_numpy(frame)
+                frame_torch = torch.from_numpy(frame_clean)
                 prob = self.vad_model(frame_torch, 16000).item()
                 return prob >= self.vad_threshold
             except Exception as e:
                 logger.error(f"VAD error: {e}")
-                return self._rms_vad(frame)
+                return self._rms_vad(frame_clean)
         else:
             # RMS fallback
-            return self._rms_vad(frame)
+            return self._rms_vad(frame_clean)
     
     def _rms_vad(self, frame: np.ndarray) -> bool:
-        """Simple RMS-based VAD"""
+        """Simple RMS-based VAD with stricter threshold"""
         rms = np.sqrt(np.mean(frame ** 2))
+        # Stricter threshold to reduce noise-based hallucinations (Matched with vad_gate.py)
         return rms > 0.01
+    def _filter_repetitions(self, text: str, max_repeat: int = 3) -> str:
+        """Filter out repetitive loops (hallucination detection)"""
+        if not text:
+            return text
+        
+        words = text.split()
+        if len(words) < max_repeat:
+            return text
+        
+        # Check for word-level repetitions
+        for i in range(len(words) - max_repeat):
+            # Check if next max_repeat words are identical
+            if all(words[i+j] == words[i] for j in range(1, max_repeat)):
+                # Found repetition - truncate at this point
+                filtered = ' '.join(words[:i])
+                if filtered:
+                    logger.warning(f"🔁 Repetition detected and filtered: '{text}' → '{filtered}'")
+                    return filtered
+                else:
+                    logger.warning(f"🔁 Entire text is repetition, dropping: '{text}'")
+                    return ""
+        
+        # Check for phrase-level repetitions (longer patterns)
+        for phrase_len in range(5, 2, -1):  # Check 5-word, 4-word, 3-word phrases
+            for i in range(len(words) - phrase_len * 2):
+                phrase1 = words[i:i+phrase_len]
+                phrase2 = words[i+phrase_len:i+phrase_len*2]
+                if phrase1 == phrase2:
+                    filtered = ' '.join(words[:i+phrase_len])
+                    logger.warning(f"🔁 Phrase repetition detected: '{' '.join(phrase1)}' repeats")
+                    return filtered
+        
+        return text
     
     def _transcribe_async(self, timestamp: float):
         """
@@ -258,31 +329,73 @@ class RealtimeAudioProcessor:
         # Copy buffer and clear immediately to not block
         audio_np = np.array(self.audio_buffer, dtype=np.float32)
         
+        # Filter out very short audio (likely noise bursts)
+        if len(audio_np) < 8000:  # Less than 0.5s at 16kHz
+            logger.info(f"⏭️ Audio too short ({len(audio_np)/16000:.2f}s), skipping transcription")
+            return
+        
         # Run transcription in thread
         import threading
         
         def transcribe():
             try:
-                # Transcribe (this is slow: ~500-1000ms)
+                # Preprocess entire buffer for transcription
+                audio_preprocessed = self._preprocess_audio(audio_np)
+                
+                # Transcribe with anti-hallucination parameters
+                # KEY FIX: Added initial_prompt to guide Whisper away from hallucinations
                 segments, info = self.whisper_model.transcribe(
-                    audio_np,
+                    audio_preprocessed,
                     language=self.source_lang,
                     beam_size=1,
                     best_of=1,
-                    temperature=0.0,
-                    vad_filter=False,
-                    condition_on_previous_text=False
+                    temperature=0.0,  # Deterministic (reduce creativity)
+                    vad_filter=False,  # We do our own VAD
+                    condition_on_previous_text=False,  # Reset context (prevent loops)
+                    without_timestamps=True,  # Reduces errors significantly
+                    initial_prompt="Transcribe only actual speech. Ignore silence, pauses, and background noise."
                 )
                 
-                # Extract text
+                # Extract text with confidence filtering
                 text_parts = []
+                low_confidence_count = 0
+                
                 for segment in segments:
-                    text_parts.append(segment.text.strip())
+                    segment_text = segment.text.strip()
+                    
+                    # Check for hallucination indicators
+                    avg_logprob = getattr(segment, 'avg_logprob', 0)
+                    no_speech_prob = getattr(segment, 'no_speech_prob', 0)
+                    
+                    # Filter out low-confidence segments (stricter threshold)
+                    if avg_logprob < -0.7 or no_speech_prob > 0.5:
+                        logger.warning(f"⚠️ Low confidence segment filtered: '{segment_text}' (logprob: {avg_logprob:.2f}, no_speech: {no_speech_prob:.2f})")
+                        low_confidence_count += 1
+                        continue
+                    
+                    # Use shared HallucinationFilter from vad_gate.py
+                    if HallucinationFilter.is_hallucination(segment_text):
+                         logger.warning(f"⚠️ Hallucination pattern detected: '{segment_text}'")
+                         continue
+
+                    text_parts.append(segment_text)
                 
                 text = " ".join(text_parts).strip()
                 
+                # Filter repetitions (catches loops like "voy por el pasillo y voy por el pasillo...")
+                text = self._filter_repetitions(text)
+                
+                # Filter very short transcripts (likely hallucination bursts)
+                word_count = len(text.split())
+                if word_count < 3:
+                    logger.warning(f"⚠️ Too short ({word_count} words), likely hallucination: '{text}'")
+                    return
+                
                 if text and len(text) > 2:
-                    logger.info(f"✅ Transcribed: '{text}'")
+                    if low_confidence_count > 0:
+                        logger.info(f"✅ Transcribed: '{text}' (filtered {low_confidence_count} low-confidence segments)")
+                    else:
+                        logger.info(f"✅ Transcribed: '{text}'")
                     
                     # Send final to callback (handle async callbacks)
                     if self.result_callback and self.event_loop:
@@ -314,6 +427,15 @@ class RealtimeAudioProcessor:
         self.result_callback = callback
     
     def stop(self):
-        """Stop processing"""
+        """Stop the audio processor"""
         self.is_running = False
+        # Don't delete shared model - other users may be using it
+        self.whisper_model = None
         logger.info(f"🛑 Stopped processor for {self.user_id}")
+        
+        # Clear GPU cache to free memory from this user's processing
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

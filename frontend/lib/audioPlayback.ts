@@ -56,6 +56,7 @@ export class AudioPlayback {
   private async playNext(): Promise<void> {
     if (this.playQueue.length === 0) {
       this.isPlaying = false
+      console.log('🏁 Playback queue empty')
       return
     }
 
@@ -65,6 +66,13 @@ export class AudioPlayback {
       // Initialize AudioContext if needed
       if (!this.audioContext) {
         this.audioContext = new AudioContext()
+        console.log('🎵 AudioContext created')
+      }
+      
+      // Resume AudioContext if suspended (browser autoplay policy)
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume()
+        console.log('▶️ AudioContext resumed from suspended state')
       }
 
       // Get next chunk

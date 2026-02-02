@@ -277,8 +277,8 @@ async def stream_text_to_audio(
                 wav_normalized = np.clip(wav, -1.0, 1.0)
                 wav_int16 = (wav_normalized * 32767).astype(np.int16)
                 
-                # Stream in chunks (0.2s = 3200 samples at 16kHz)
-                chunk_size = 3200
+                # Stream in chunks (0.1s = 2400 samples at 24kHz - XTTS output rate)
+                chunk_size = 2400  # 24kHz * 0.1s
                 total_samples = len(wav_int16)
                 
                 for i in range(0, total_samples, chunk_size):
@@ -286,11 +286,8 @@ async def stream_text_to_audio(
                     audio_bytes = chunk.tobytes()
                     audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
                     
-                    # Yield chunk immediately
+                    # Yield chunk immediately (no artificial delays)
                     yield audio_base64
-                    
-                    # Small delay to simulate streaming (remove in production)
-                    await asyncio.sleep(0.01)
                 
                 logger.info(f"Streamed {total_samples} samples in {total_samples//chunk_size + 1} chunks")
                 

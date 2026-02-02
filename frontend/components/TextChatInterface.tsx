@@ -1,8 +1,14 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
-import { Send, User, Settings, MoreVertical, LogOut } from 'lucide-react'
+import { Send, User, Settings, MoreVertical, LogOut, Smile, Mic, StopCircle, Play, Pause } from 'lucide-react'
 import { useConnectionStore } from '@/lib/store'
+import dynamic from 'next/dynamic'
+import type { EmojiClickData } from 'emoji-picker-react'
+import VoiceNotePlayer from './VoiceNotePlayer'
+import { AudioPlayback } from '@/lib/audioPlayback'
+
+const EmojiPicker = dynamic(() => import('emoji-picker-react'), { ssr: false })
 
 interface TextChatInterfaceProps {
   language: string
@@ -11,7 +17,15 @@ interface TextChatInterfaceProps {
 
 export default function TextChatInterface({ language, onDisconnect }: TextChatInterfaceProps) {
   const [message, setMessage] = useState('')
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false)
+  const [isRecordingVoiceNote, setIsRecordingVoiceNote] = useState(false)
+  const [recordingTime, setRecordingTime] = useState(0)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const audioPlaybackRef = useRef<AudioPlayback | null>(null)
+  const hasCalledFindPartnerRef = useRef(false)
   
   // Zustand store
   const status = useConnectionStore(state => state.status)
@@ -19,10 +33,34 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
   const messages = useConnectionStore(state => state.messages)
   const isPartnerTyping = useConnectionStore(state => state.isPartnerTyping)
   const sendTextMessage = useConnectionStore(state => state.sendTextMessage)
+  const sendVoiceNote = useConnectionStore(state => state.sendVoiceNote)
   const sendTypingIndicator = useConnectionStore(state => state.sendTypingIndicator)
   const initialize = useConnectionStore(state => state.initialize)
   const findPartner = useConnectionStore(state => state.findPartner)
   const disconnect = useConnectionStore(state => state.disconnect)
+  
+  // Initialize AudioPlayback for voice note TTS playback
+  useEffect(() => {
+    // Create AudioPlayback ONCE and keep it on window permanently
+    if (!(window as any).audioPlayback) {
+      console.log('🔊 Creating AudioPlayback instance for text chat')
+      const playback = new AudioPlayback()
+      audioPlaybackRef.current = playback
+      ;(window as any).audioPlayback = playback
+    } else {
+      // Reuse existing instance
+      console.log('🔊 Reusing existing AudioPlayback instance')
+      audioPlaybackRef.current = (window as any).audioPlayback
+    }
+    
+    return () => {
+      // DON'T delete window.audioPlayback - keep it for voice note chunks
+      if (audioPlaybackRef.current) {
+        console.log('🛑 Stopping playback (keeping instance)')
+        audioPlaybackRef.current.stop()
+      }
+    }
+  }, [])
   
   // Initialize WebSocket connection
   useEffect(() => {
@@ -33,10 +71,15 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
   
   // Auto-find partner when connected
   useEffect(() => {
-    if (status === 'connected') {
+    if (status === 'connected' && !hasCalledFindPartnerRef.current) {
+      console.log('🔍 Auto-calling findPartner (first time only)')
+      hasCalledFindPartnerRef.current = true
       findPartner()
+    } else if (status === 'disconnected') {
+      // Reset flag when disconnected so we can find partner again on reconnect
+      hasCalledFindPartnerRef.current = false
     }
-  }, [status])
+  }, [status, findPartner])
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -64,6 +107,68 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
     disconnect()
     onDisconnect()
   }
+
+  const handleEmojiClick = (emojiData: EmojiClickData) => {
+    setMessage(prev => prev + emojiData.emoji)
+    setShowEmojiPicker(false)
+  }
+
+  const startVoiceNoteRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mediaRecorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = mediaRecorder
+      audioChunksRef.current = []
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data)
+        }
+      }
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+        const reader = new FileReader()
+        reader.onloadend = () => {
+          const base64Audio = reader.result as string
+          const base64Data = base64Audio.split(',')[1]
+          sendVoiceNote(base64Data)
+        }
+        reader.readAsDataURL(audioBlob)
+        
+        stream.getTracks().forEach(track => track.stop())
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current)
+        }
+        setRecordingTime(0)
+      }
+
+      mediaRecorder.start()
+      setIsRecordingVoiceNote(true)
+      
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1)
+      }, 1000)
+    } catch (error) {
+      console.error('Failed to start voice note recording:', error)
+      alert('Failed to access microphone')
+    }
+  }
+
+  const stopVoiceNoteRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+      setIsRecordingVoiceNote(false)
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current)
+      }
+    }
+  }, [])
 
   return (
     <div className="h-screen bg-gradient-to-br from-orange-50 to-blue-50 flex items-center justify-center p-4">
@@ -193,7 +298,11 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
                             : 'bg-white text-gray-900 shadow-md'
                         }`}
                       >
-                        <p className="text-sm leading-relaxed">{msg.text}</p>
+                        {msg.voiceNote ? (
+                          <VoiceNotePlayer audioData={msg.voiceNote} isOwn={msg.isOwn} />
+                        ) : (
+                          <p className="text-sm leading-relaxed">{msg.text}</p>
+                        )}
                         
                         {/* Original text (for received messages) */}
                         {!msg.isOwn && msg.originalText && msg.originalText !== msg.text && (
@@ -243,7 +352,50 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
 
           {/* Message Input */}
           <div className="bg-white border-t border-gray-200 p-6">
+            {/* Voice Recording Indicator */}
+            {isRecordingVoiceNote && (
+              <div className="mb-4 bg-red-50 border border-red-200 rounded-xl p-4 flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
+                  <span className="text-red-700 font-medium">Recording voice note...</span>
+                  <span className="text-red-600">{Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}</span>
+                </div>
+                <button
+                  onClick={stopVoiceNoteRecording}
+                  className="bg-red-500 hover:bg-red-600 text-white rounded-lg px-4 py-2 font-medium flex items-center space-x-2"
+                >
+                  <StopCircle size={18} />
+                  <span>Stop & Send</span>
+                </button>
+              </div>
+            )}
+            
             <div className="flex items-end space-x-3">
+              {/* Emoji Picker Button */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+                  disabled={status !== 'paired' || isRecordingVoiceNote}
+                  className="p-3 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Smile size={24} className="text-gray-600" />
+                </button>
+                {showEmojiPicker && (
+                  <div className="absolute bottom-full left-0 mb-2 z-50">
+                    <EmojiPicker onEmojiClick={handleEmojiClick} />
+                  </div>
+                )}
+              </div>
+              
+              {/* Voice Note Button */}
+              <button
+                onClick={startVoiceNoteRecording}
+                disabled={status !== 'paired' || isRecordingVoiceNote}
+                className="p-3 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Mic size={24} className="text-gray-600" />
+              </button>
+              
               <div className="flex-1">
                 <textarea
                   value={message}
@@ -255,7 +407,7 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
                     }
                   }}
                   placeholder={status === 'paired' ? "Type your message..." : status === 'searching' ? "Finding partner..." : "Connecting..."}
-                  disabled={status !== 'paired'}
+                  disabled={status !== 'paired' || isRecordingVoiceNote}
                   rows={3}
                   className="w-full bg-gray-50 text-gray-900 rounded-2xl px-5 py-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-[#FF6B35] disabled:opacity-50 disabled:cursor-not-allowed"
                 />
@@ -265,7 +417,7 @@ export default function TextChatInterface({ language, onDisconnect }: TextChatIn
               </div>
               <button
                 onClick={handleSendMessage}
-                disabled={status !== 'paired' || !message.trim()}
+                disabled={status !== 'paired' || !message.trim() || isRecordingVoiceNote}
                 className="bg-gradient-to-br from-[#FF6B35] to-[#1B3A57] hover:from-[#FF8C5A] hover:to-[#0F2E4D] disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-2xl px-8 py-4 font-semibold transition-all shadow-lg hover:shadow-xl flex items-center space-x-2"
               >
                 <Send size={20} />

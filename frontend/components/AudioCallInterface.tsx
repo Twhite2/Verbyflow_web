@@ -115,18 +115,25 @@ export default function AudioCallInterface({ language, onDisconnect }: AudioCall
   
   // Initialize audio playback and expose globally for WebSocket messages
   useEffect(() => {
-    if (!audioPlaybackRef.current) {
-      audioPlaybackRef.current = new AudioPlayback()
-      // Expose to window for WebSocket message handler
-      ;(window as any).audioPlayback = audioPlaybackRef.current
+    // Create AudioPlayback ONCE and keep it on window permanently
+    if (!(window as any).audioPlayback) {
+      console.log('🔊 Creating AudioPlayback instance')
+      const playback = new AudioPlayback()
+      audioPlaybackRef.current = playback
+      ;(window as any).audioPlayback = playback
+    } else {
+      // Reuse existing instance
+      console.log('🔊 Reusing existing AudioPlayback instance')
+      audioPlaybackRef.current = (window as any).audioPlayback
     }
     
     return () => {
-      // Cleanup on unmount
+      // DON'T delete window.audioPlayback - keep it for audio chunks
+      // Just stop current playback
       if (audioPlaybackRef.current) {
+        console.log('🛑 Stopping playback (keeping instance)')
         audioPlaybackRef.current.stop()
       }
-      delete (window as any).audioPlayback
     }
   }, [])
   

@@ -12,6 +12,9 @@ from stt import process_audio_to_text
 from tts import process_text_to_audio, stream_text_to_audio, clear_voice_cache
 from translator import translate_text
 from realtime_audio_processor import RealtimeAudioProcessor
+from voice_note_processor import transcribe_voice_note
+import base64
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,9 @@ class ConnectionManager:
         
         # Real-time audio processors (hybrid architecture)
         self.audio_processors: Dict[str, RealtimeAudioProcessor] = {}
+        
+        # TTS task tracking - prevent overlapping TTS for same user
+        self.active_tts_tasks: Dict[str, asyncio.Task] = {}
         
     async def connect(self, websocket: WebSocket, user_id: str, language: str = "en"):
         """Register a new WebSocket connection"""
@@ -103,63 +109,122 @@ class ConnectionManager:
                 translated = text
                 logger.info(f"📝 No translation needed (same language)")
             
+            # Send translated text message to partner FIRST (so they see it immediately)
+            await self.send_to_user(partner_id, {
+                'type': 'message',
+                'text': translated,
+                'original_text': text,
+                'from_user': user_id,
+                'isOwn': False
+            })
+            logger.info(f"💬 Text message sent to {partner_id}")
+            
             # Step 2: Generate TTS with PARTNER's voice sample
-            # CRITICAL: Use partner's voice to clone their voice when speaking back to them
+            # CRITICAL: Cancel previous TTS if still running (prevent overlapping audio)
+            if partner_id in self.active_tts_tasks:
+                old_task = self.active_tts_tasks[partner_id]
+                if not old_task.done():
+                    logger.info(f"🛑 Cancelling previous TTS for {partner_id} (new transcript arrived)")
+                    old_task.cancel()
+                    try:
+                        await old_task
+                    except asyncio.CancelledError:
+                        pass
+            
             partner_voice_sample = self.voice_samples.get(partner_id)
             
             if not partner_voice_sample:
                 logger.warning(f"⚠️ No voice sample for partner {partner_id}, skipping TTS")
                 return
             
-            tts_start = time.time()
-            chunk_count = 0
+            # Create and track TTS task
+            async def generate_and_stream_tts():
+                tts_start = time.time()
+                chunk_count = 0
+                
+                try:
+                    # Use streaming TTS with correct parameters
+                    async for audio_chunk in stream_text_to_audio(
+                        text=translated, 
+                        language=target_lang,
+                        user_id=partner_id,  # For voice caching
+                        voice_sample=partner_voice_sample
+                    ):
+                        chunk_count += 1
+                        await self.send_to_user(partner_id, {
+                            'type': 'audio_chunk',
+                            'audio': audio_chunk,
+                            'text': translated if chunk_count == 1 else None
+                        })
+                    
+                    tts_time = time.time() - tts_start
+                    total_time = time.time() - pipeline_start
+                    
+                    logger.info(f"🔊 TTS complete ({tts_time:.2f}s): {chunk_count} chunks sent to {partner_id}")
+                    logger.info(f"✅ Pipeline complete ({total_time:.2f}s total)")
+                    
+                except asyncio.CancelledError:
+                    logger.info(f"🛑 TTS cancelled for {partner_id}")
+                    raise
+                finally:
+                    # Clean up task tracking
+                    if partner_id in self.active_tts_tasks:
+                        del self.active_tts_tasks[partner_id]
             
-            # Use streaming TTS with correct parameters
-            async for audio_chunk in stream_text_to_audio(
-                text=translated, 
-                language=target_lang,
-                user_id=partner_id,  # For voice caching
-                voice_sample=partner_voice_sample
-            ):
-                chunk_count += 1
-                await self.send_to_user(partner_id, {
-                    'type': 'audio_chunk',
-                    'audio': audio_chunk
-                })
+            # Start TTS task
+            task = asyncio.create_task(generate_and_stream_tts())
+            self.active_tts_tasks[partner_id] = task
+            await task
             
-            tts_time = time.time() - tts_start
-            total_time = time.time() - pipeline_start
-            
-            logger.info(f"🔊 TTS complete ({tts_time:.2f}s): {chunk_count} chunks sent to {partner_id}")
-            logger.info(f"✅ Pipeline complete ({total_time:.2f}s total)")
-            
+        except asyncio.CancelledError:
+            # Propagate cancellation
+            raise
         except Exception as e:
             logger.error(f"❌ Pipeline error: {e}", exc_info=True)
     
     async def disconnect(self, user_id: str):
         """Remove user from all tracking structures"""
+        logger.info(f"🔌 Disconnecting user {user_id}")
+        
+        # Cancel any active TTS for this user
+        if user_id in self.active_tts_tasks:
+            task = self.active_tts_tasks[user_id]
+            if not task.done():
+                logger.info(f"🛑 Cancelling TTS for disconnecting user {user_id}")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            del self.active_tts_tasks[user_id]
+        
         # Stop audio processor if exists
         if user_id in self.audio_processors:
             processor = self.audio_processors[user_id]
             processor.stop()
             del self.audio_processors[user_id]
         
-        # Remove from waiting queue
-        if user_id in self.waiting_queue:
+        # Remove from waiting queue (check for duplicates)
+        while user_id in self.waiting_queue:
             self.waiting_queue.remove(user_id)
+            logger.info(f"Removed {user_id} from waiting queue")
             
         # Notify partner if paired
         partner_id = self.paired_users.get(user_id)
         if partner_id:
-            # Remove the pairing
-            del self.paired_users[user_id]
-            if partner_id in self.paired_users:
-                del self.paired_users[partner_id]
+            # Remove the pairing (both directions)
+            logger.info(f"Removing pairing: {user_id} <-> {partner_id}")
+            self.paired_users.pop(user_id, None)
+            self.paired_users.pop(partner_id, None)
             
-        # Clean up
+        # Clean up all references
         self.active_connections.pop(user_id, None)
         self.user_languages.pop(user_id, None)
-        logger.info(f"User {user_id} disconnected")
+        self.voice_samples.pop(user_id, None)
+        
+        logger.info(f"✅ User {user_id} fully disconnected and cleaned up")
+        logger.info(f"Remaining pairs: {self.paired_users}")
+        logger.info(f"Remaining queue: {self.waiting_queue}")
         
         return partner_id
         
@@ -171,9 +236,28 @@ class ConnectionManager:
         async with self.lock:  # CRITICAL: Lock protects against race conditions
             logger.info(f"🔒 Lock acquired for {user_id}, queue state: {self.waiting_queue}")
             
+            # CRITICAL: Remove user from queue if they're somehow already there (prevents self-pairing)
+            if user_id in self.waiting_queue:
+                logger.warning(f"⚠️ User {user_id} already in waiting queue, removing duplicate")
+                self.waiting_queue.remove(user_id)
+            
             if self.waiting_queue:
                 # Get first person in queue
                 partner_id = self.waiting_queue.pop(0)
+                
+                # CRITICAL: Prevent self-pairing (should never happen now, but double-check)
+                if partner_id == user_id:
+                    logger.error(f"🚨 PREVENTED SELF-PAIRING: {user_id} tried to pair with themselves!")
+                    # This should never happen due to removal above, but if it does, add user back to queue
+                    self.waiting_queue.append(user_id)
+                    logger.info(f"Added {user_id} back to waiting queue")
+                    return None
+                
+                # Verify partner is still connected
+                if partner_id not in self.active_connections:
+                    logger.warning(f"⚠️ Partner {partner_id} not in active connections, adding {user_id} to queue")
+                    self.waiting_queue.append(user_id)
+                    return None
                 
                 # Create pairing
                 self.paired_users[user_id] = partner_id
@@ -190,9 +274,12 @@ class ConnectionManager:
                 logger.info(f"🔓 Lock released, paired: {user_id} <-> {partner_id}")
                 return partner_id
             else:
-                # Add to waiting queue
-                self.waiting_queue.append(user_id)
-                logger.info(f"User {user_id} added to waiting queue")
+                # Add to waiting queue (only if not already there)
+                if user_id not in self.waiting_queue:
+                    self.waiting_queue.append(user_id)
+                    logger.info(f"User {user_id} added to waiting queue")
+                else:
+                    logger.warning(f"⚠️ User {user_id} already in queue, not adding duplicate")
                 logger.info(f"🔓 Lock released, queue now: {self.waiting_queue}")
                 return None
             
@@ -325,7 +412,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
                         
                         if processor:
                             # Convert base64 to bytes if needed
-                            import base64
                             if isinstance(audio_data, str):
                                 frame_bytes = base64.b64decode(audio_data)
                             else:
@@ -448,6 +534,96 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
                     "message_id": data.get("message_id"),
                     "timestamp": data.get("timestamp")
                 })
+                
+            elif message_type == "voice_note":
+                # Handle voice note with STT → Translation → TTS pipeline
+                partner_id = manager.paired_users.get(user_id)
+                
+                logger.info(f"🎤 Voice note from {user_id}: sender={user_id}, partner={partner_id}")
+                
+                if not partner_id:
+                    logger.warning(f"User {user_id} tried to send voice note without partner")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "No partner connected"
+                    })
+                    continue
+                
+                if partner_id == user_id:
+                    logger.error(f"🚨 BUG DETECTED: User {user_id} is paired with themselves!")
+                    continue
+                
+                audio_data = data.get("audio", "")
+                if not audio_data:
+                    continue
+                
+                # Get languages
+                source_lang = manager.user_languages.get(user_id, "en")
+                target_lang = manager.user_languages.get(partner_id, "en")
+                
+                try:
+                    # Step 1: Transcribe voice note (STT)
+                    logger.info(f"📝 Transcribing voice note: {source_lang} → {target_lang}")
+                    transcribed_text, voice_sample_bytes = await transcribe_voice_note(audio_data, source_lang)
+                    
+                    if not transcribed_text:
+                        logger.warning("⚠️ Voice note transcription empty, skipping")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Could not transcribe voice note"
+                        })
+                        continue
+                    
+                    logger.info(f"✅ Transcribed: '{transcribed_text}'")
+                    
+                    # Step 2: Translate if different languages
+                    if source_lang != target_lang:
+                        logger.info(f"🌐 Translating: {source_lang} → {target_lang}")
+                        translated_text = await translate_text(transcribed_text, source_lang, target_lang)
+                    else:
+                        translated_text = transcribed_text
+                        logger.info(f"Same language ({source_lang}), no translation needed")
+                    
+                    # Step 3: Generate TTS with sender's voice from the voice note
+                    logger.info(f"🔊 Generating TTS with sender's voice for partner {partner_id}")
+                    
+                    # Convert voice sample bytes to base64 for TTS
+                    voice_sample_base64 = base64.b64encode(voice_sample_bytes).decode('utf-8')
+                    
+                    # Stream TTS to partner using sender's voice
+                    chunk_count = 0
+                    async for audio_chunk in stream_text_to_audio(
+                        text=translated_text,
+                        language=target_lang,
+                        user_id=f"voice_note_{user_id}",  # Unique cache key for voice notes
+                        voice_sample=voice_sample_base64
+                    ):
+                        chunk_count += 1
+                        # Send as voice_note_received with TTS audio
+                        await manager.send_to_user(partner_id, {
+                            "type": "voice_note_received",
+                            "audio": audio_chunk,
+                            "text": translated_text if chunk_count == 1 else None,
+                            "original_text": transcribed_text,
+                            "from_user": user_id,
+                            "timestamp": data.get("timestamp")
+                        })
+                    
+                    logger.info(f"✅ Voice note translated and sent to {partner_id} ({chunk_count} chunks)")
+                    
+                    # Confirm to sender
+                    await websocket.send_json({
+                        "type": "voice_note_sent",
+                        "message_id": data.get("message_id"),
+                        "timestamp": data.get("timestamp")
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"❌ Voice note processing failed: {e}", exc_info=True)
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Failed to process voice note"
+                    })
                 
             elif message_type == "typing_indicator":
                 # Relay typing indicator to partner

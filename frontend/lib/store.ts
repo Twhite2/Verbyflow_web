@@ -9,6 +9,7 @@ interface Message {
   isOwn: boolean
   timestamp: Date
   hasAudio?: boolean
+  voiceNote?: string  // Base64 encoded audio data
 }
 
 interface ConnectionState {
@@ -59,6 +60,7 @@ interface ConnectionState {
     onWebRTCIceCandidate?: (candidate: RTCIceCandidateInit, fromUser: string) => void
   }) => void
   sendTextMessage: (text: string) => void
+  sendVoiceNote: (audioData: string) => void
   sendTypingIndicator: (isTyping: boolean) => void
 }
 
@@ -107,7 +109,7 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data)
-        console.log('📩 WebSocket message received:', data.type)
+        console.log('📩 WebSocket message received:', data.type, data)
         
         switch (data.type) {
           case 'connected':
@@ -142,9 +144,32 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             break
             
           case 'partner_disconnected':
-            set({ status: 'connected', partnerId: null })
+            // Stop all audio on disconnect (like a phone call)
+            const audioPlayback = (window as any).audioPlayback
+            if (audioPlayback) {
+              console.log('📞 Partner disconnected - stopping audio playback')
+              audioPlayback.stop()
+            }
+            
+            const audioWorklet = (window as any).audioWorklet
+            if (audioWorklet) {
+              console.log('📞 Partner disconnected - stopping audio capture')
+              audioWorklet.stopCapture()
+            }
+            
+            set({ status: 'connected', partnerId: null, isRecording: false })
             get().addMessage({
               text: 'Partner disconnected.',
+              isOwn: false,
+            })
+            break
+            
+          case 'message':
+            // Translated text message from partner
+            console.log('💬 Message received:', data.text)
+            get().addMessage({
+              text: data.text,
+              originalText: data.original_text,
               isOwn: false,
             })
             break
@@ -418,8 +443,34 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             get().addMessage({
               text: data.text,
               originalText: data.original_text,
-              isOwn: false
+              isOwn: false,
             })
+            break
+            
+          case 'voice_note_received':
+            console.log('🎤 Voice note received from partner (translated with sender\'s voice)')
+            
+            // Voice notes are now sent as TTS audio chunks (like audio_chunk)
+            // Play through AudioPlayback instead of storing raw audio
+            if (data.audio) {
+              const audioPlayback = (window as any).audioPlayback
+              if (audioPlayback) {
+                console.log('✅ Enqueuing voice note chunk to AudioPlayback')
+                audioPlayback.enqueueChunk(data.audio)
+              } else {
+                console.error('❌ AudioPlayback not found for voice note!')
+              }
+            }
+            
+            // Add text message on first chunk (when text is present)
+            if (data.text) {
+              console.log('💬 Voice note text:', data.text)
+              get().addMessage({
+                text: data.text,
+                originalText: data.original_text,
+                isOwn: false,
+              })
+            }
             break
             
           case 'text_message_sent':
@@ -713,6 +764,37 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       })
     } else {
       console.error('Cannot send text message - WebSocket not ready')
+    }
+  },
+  
+  sendVoiceNote: (audioData) => {
+    const { ws, status } = get()
+    
+    if (status !== 'paired') {
+      console.warn('Cannot send voice note - not paired')
+      return
+    }
+    
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const messageId = `voice_${Date.now()}_${Math.random()}`
+      const timestamp = new Date().toISOString()
+      
+      console.log('🎤 Sending voice note')
+      ws.send(JSON.stringify({
+        type: 'voice_note',
+        audio: audioData,
+        message_id: messageId,
+        timestamp
+      }))
+      
+      // Add voice note message to local store immediately
+      get().addMessage({
+        text: 'Voice note',
+        isOwn: true,
+        voiceNote: audioData
+      })
+    } else {
+      console.error('Cannot send voice note - WebSocket not ready')
     }
   },
   
