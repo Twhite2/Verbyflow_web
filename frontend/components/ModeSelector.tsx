@@ -33,7 +33,7 @@ export default function ModeSelector({ onModeSelect }: ModeSelectorProps) {
             onClick={() => onModeSelect('video')}
             className="group bg-white rounded-2xl p-8 cursor-pointer transform transition-all duration-300 hover:scale-105 hover:shadow-2xl"
           >
-            <div className="bg-gradient-to-br from-[#1B3A57] to-[#0F2E4D] w-20 h-20 rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
+            <div className="bg-gradient-to-br from-[#1B3A57] to-[#0F2E4D] w-20 h-20 rounded-2xl flex items-center justify-center mb-6">
               <Video size={40} className="text-white" />
             </div>
             <h3 className="text-2xl font-bold font-display text-gray-900 mb-3">Video Call</h3>
@@ -64,17 +64,17 @@ export default function ModeSelector({ onModeSelect }: ModeSelectorProps) {
             onClick={() => onModeSelect('audio')}
             className="group bg-white rounded-2xl p-8 cursor-pointer transform transition-all duration-300 hover:scale-105 hover:shadow-2xl"
           >
-            <div className="bg-gradient-to-br from-[#FF6B35] to-[#FF8C5A] w-20 h-20 rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
+            <div className="bg-gradient-to-br from-[#FF6B35] to-[#FF8C5A] w-20 h-20 rounded-2xl flex items-center justify-center mb-6">
               <Phone size={40} className="text-white" />
             </div>
             <h3 className="text-2xl font-bold font-display text-gray-900 mb-3">Audio Call</h3>
             <p className="text-gray-600 mb-4">
-              Voice-only conversation with real-time translation using voice cloning
+              Voice-only conversation with real-time translation using multilingual voices
             </p>
             <ul className="space-y-2 text-sm text-gray-500">
               <li className="flex items-center">
                 <span className="w-1.5 h-1.5 bg-[#FF6B35] rounded-full mr-2"></span>
-                Voice cloning AI
+                Predefined multilingual voices
               </li>
               <li className="flex items-center">
                 <span className="w-1.5 h-1.5 bg-[#FF6B35] rounded-full mr-2"></span>

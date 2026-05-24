@@ -56,18 +56,18 @@ async def preload_all_models():
         except Exception as e:
             logger.error(f"Failed to load TTS model: {e}")
     
-    async def load_whisper_base():
-        """Preload Faster-Whisper base model"""
+    async def load_whisper_small():
+        """Preload Faster-Whisper small model for better accuracy"""
         from faster_whisper import WhisperModel
         import torch
         try:
-            logger.info("Loading Faster-Whisper base model...")
+            logger.info("Loading Faster-Whisper small model...")
             device = "cuda" if torch.cuda.is_available() else "cpu"
             compute_type = "int8_float16" if device == "cuda" else "int8"
             
             # Just load to cache - will be reused by processors
-            _ = WhisperModel("base", device=device, compute_type=compute_type, num_workers=2)
-            logger.info("✅ Whisper model loaded")
+            _ = WhisperModel("small", device=device, compute_type=compute_type, num_workers=2)
+            logger.info("✅ Whisper 'small' model loaded")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
     
@@ -76,7 +76,7 @@ async def preload_all_models():
         await asyncio.gather(
             load_translation_models(),
             load_tts_model(),
-            load_whisper_base()
+            load_whisper_small()
         )
         
         elapsed = asyncio.get_event_loop().time() - start_time

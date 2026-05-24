@@ -1,6 +1,7 @@
 """
 Voice Note Processing - Transcription and Translation
-Handles voice note STT using Whisper, uses the voice note itself as TTS voice sample
+Handles voice note STT using Whisper for transcription only.
+No voice cloning - TTS uses predefined voices selected by language and gender.
 """
 
 import base64
@@ -51,7 +52,7 @@ async def transcribe_voice_note(audio_base64: str, language: str) -> Tuple[str, 
         language: Source language code
         
     Returns:
-        Tuple of (transcribed_text, raw_audio_bytes for voice cloning)
+        Tuple of (transcribed_text, empty bytes placeholder for backward compat)
     """
     try:
         # Decode base64
@@ -74,17 +75,6 @@ async def transcribe_voice_note(audio_base64: str, language: str) -> Tuple[str, 
             '-ac', '1',      # Mono
             '-f', 'wav',
             wav_path,
-            '-y'
-        ], capture_output=True, check=True)
-        
-        # Also create 24kHz version for TTS voice cloning
-        voice_sample_path = webm_path.replace('.webm', '_voice.wav')
-        subprocess.run([
-            'ffmpeg', '-i', webm_path,
-            '-ar', '24000',  # 24kHz for XTTS
-            '-ac', '1',      # Mono
-            '-f', 'wav',
-            voice_sample_path,
             '-y'
         ], capture_output=True, check=True)
         
@@ -129,15 +119,10 @@ async def transcribe_voice_note(audio_base64: str, language: str) -> Tuple[str, 
         
         transcribed_text = " ".join(text_parts).strip()
         
-        # Read voice sample bytes for TTS
-        with open(voice_sample_path, 'rb') as f:
-            voice_sample_bytes = f.read()
-        
         # Cleanup temp files
         import os
         os.unlink(webm_path)
         os.unlink(wav_path)
-        os.unlink(voice_sample_path)
         
         logger.info(f"✅ Voice note transcribed: '{transcribed_text}' (duration: {info.duration:.1f}s)")
         
@@ -149,7 +134,7 @@ async def transcribe_voice_note(audio_base64: str, language: str) -> Tuple[str, 
         except Exception:
             pass
         
-        return transcribed_text, voice_sample_bytes
+        return transcribed_text, b''
         
     except Exception as e:
         logger.error(f"Voice note transcription error: {e}", exc_info=True)

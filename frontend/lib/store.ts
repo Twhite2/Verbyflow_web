@@ -10,6 +10,8 @@ interface Message {
   timestamp: Date
   hasAudio?: boolean
   voiceNote?: string  // Base64 encoded audio data
+  audioData?: string  // Base64 encoded audio for playback
+  type?: 'text' | 'voice_note'  // Message type
 }
 
 interface ConnectionState {
@@ -18,6 +20,7 @@ interface ConnectionState {
   userId: string | null
   partnerId: string | null
   language: string
+  gender: string  // 'male' or 'female' - for TTS voice selection
   
   // Messages
   messages: Message[]
@@ -25,9 +28,7 @@ interface ConnectionState {
   // Audio state
   isRecording: boolean
   isSpeaking: boolean
-  voiceSampleCaptured: boolean
-  isCapturingVoice: boolean
-  storedVoiceSample: string | null  // Store voice sample for reuse
+  ttsPlaying: boolean  // True when TTS audio is playing (echo suppression)
   
   // WebSocket
   ws: WebSocket | null
@@ -43,14 +44,12 @@ interface ConnectionState {
   // Actions
   initialize: () => void
   setLanguage: (lang: string) => void
-  captureVoiceSample: () => Promise<void>
+  setGender: (gender: string) => void
   findPartner: () => void
   disconnect: () => void
   sendAudioChunk: (audioData: string) => void
-  sendVoiceSample: (audioData: string) => void
   addMessage: (message: Omit<Message, 'id' | 'timestamp'>) => void
   toggleRecording: () => void
-  loadVoiceSample: () => void
   sendWebRTCOffer: (offer: RTCSessionDescriptionInit) => void
   sendWebRTCAnswer: (answer: RTCSessionDescriptionInit) => void
   sendWebRTCIceCandidate: (candidate: RTCIceCandidateInit) => void
@@ -62,6 +61,7 @@ interface ConnectionState {
   sendTextMessage: (text: string) => void
   sendVoiceNote: (audioData: string) => void
   sendTypingIndicator: (isTyping: boolean) => void
+  clearMessages: () => void
 }
 
 export const useConnectionStore = create<ConnectionState>((set, get) => ({
@@ -70,41 +70,43 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   userId: null,
   partnerId: null,
   language: 'en',
+  gender: 'female',
   messages: [],
   isRecording: false,
+  ttsPlaying: false,
   isSpeaking: false,
-  voiceSampleCaptured: false,
-  isCapturingVoice: false,
-  storedVoiceSample: null,
   ws: null,
   isPartnerTyping: false,
   
   // Initialize connection
   initialize: () => {
-    // Prevent duplicate connections
+    // Prevent duplicate connections - check BOTH open AND connecting states
     const currentWs = get().ws
-    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
-      console.log('WebSocket already connected, skipping initialization')
+    if (currentWs && (currentWs.readyState === WebSocket.OPEN || currentWs.readyState === WebSocket.CONNECTING)) {
+      console.log('WebSocket already connected/connecting, skipping initialization')
       return
     }
     
+    // Close any stale connection before creating a new one
+    if (currentWs) {
+      console.log('Closing stale WebSocket before reconnecting')
+      currentWs.onclose = null  // Prevent onclose from firing
+      currentWs.onerror = null
+      currentWs.onmessage = null
+      currentWs.close()
+    }
+    
     const userId = `user_${Math.random().toString(36).substr(2, 9)}`
-    const wsUrl = `ws://localhost:8000/ws/${userId}?lang=${get().language}`
+    const wsUrl = `ws://localhost:8000/ws/${userId}?lang=${get().language}&gender=${get().gender}`
     
     try {
-      set({ status: 'connecting' })  // Set to connecting immediately
       const ws = new WebSocket(wsUrl)
+      // CRITICAL: Store WS and userId immediately to prevent duplicate connections
+      set({ status: 'connecting', ws, userId })
       
       ws.onopen = () => {
-        console.log('WebSocket connected')
-        set({ status: 'connected', userId, ws })
-        
-        // Auto-send stored voice sample if available
-        const storedSample = get().storedVoiceSample
-        if (storedSample) {
-          console.log('Auto-sending stored voice sample on reconnect')
-          get().sendVoiceSample(storedSample)
-        }
+        console.log(`WebSocket connected as ${userId}`)
+        set({ status: 'connected' })
       }
       
       ws.onmessage = (event) => {
@@ -116,8 +118,8 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             set({ status: 'connected' })
             break
           
-          case 'voice_sample_received':
-            console.log('Voice sample stored on server')
+          case 'gender_updated':
+            console.log('Gender preference updated on server:', data.gender)
             break
             
           case 'searching':
@@ -134,13 +136,6 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
               text: 'Partner connected! Start speaking...',
               isOwn: false,
             })
-            
-            // Auto-resend stored voice sample for new partner
-            const storedSample = get().storedVoiceSample
-            if (storedSample) {
-              console.log('Resending stored voice sample to new partner')
-              get().sendVoiceSample(storedSample)
-            }
             break
             
           case 'partner_disconnected':
@@ -178,6 +173,18 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             // Real-time partial transcript (UI only, not translated)
             console.log('💬 Partial transcript:', data.text)
             // Store in state or display - handled by component
+            break
+          
+          case 'tts_playing':
+            // Echo suppression: TTS is about to play, pause mic capture
+            console.log('🔇 TTS playing - echo suppression ON')
+            set({ ttsPlaying: true })
+            break
+          
+          case 'tts_done':
+            // Echo suppression: TTS finished, resume mic capture
+            console.log('🔊 TTS done - echo suppression OFF')
+            set({ ttsPlaying: false })
             break
           
           case 'audio_chunk':
@@ -448,28 +455,30 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
             break
             
           case 'voice_note_received':
-            console.log('🎤 Voice note received from partner (translated with sender\'s voice)')
+            console.log('🎤 Voice note received from partner with transcription')
+            console.log('📦 Voice note data:', {
+              hasText: !!data.text,
+              hasAudio: !!data.audio,
+              textLength: data.text?.length,
+              audioLength: data.audio?.length,
+              originalText: data.original_text
+            })
             
-            // Voice notes are now sent as TTS audio chunks (like audio_chunk)
-            // Play through AudioPlayback instead of storing raw audio
-            if (data.audio) {
-              const audioPlayback = (window as any).audioPlayback
-              if (audioPlayback) {
-                console.log('✅ Enqueuing voice note chunk to AudioPlayback')
-                audioPlayback.enqueueChunk(data.audio)
-              } else {
-                console.error('❌ AudioPlayback not found for voice note!')
-              }
-            }
-            
-            // Add text message on first chunk (when text is present)
-            if (data.text) {
-              console.log('💬 Voice note text:', data.text)
+            // Voice notes now send original audio + translated text
+            // Store the audio blob and transcription text
+            if (data.text && data.audio) {
+              console.log('💬 Voice note translated text:', data.text)
+              console.log('🔊 Voice note audio (first 50 chars):', data.audio.substring(0, 50))
               get().addMessage({
-                text: data.text,
-                originalText: data.original_text,
+                text: data.text,  // Translated text for reading
+                originalText: data.original_text,  // Original transcription
+                audioData: data.audio,  // Original audio blob (base64)
                 isOwn: false,
+                type: 'voice_note'
               })
+              console.log('✅ Voice note message added to store')
+            } else {
+              console.error('❌ Voice note missing text or audio!', { hasText: !!data.text, hasAudio: !!data.audio })
             }
             break
             
@@ -517,7 +526,6 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
         ws: null, 
         partnerId: null, 
         messages: []
-        // Keep voiceSampleCaptured and storedVoiceSample - no need to recapture!
       })
       
       // Auto-reconnect with new language after a short delay
@@ -562,7 +570,6 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       ws.send(JSON.stringify({ type: 'disconnect' }))
     }
     
-    // Keep voice sample and voiceSampleCaptured state for next connection
     set({ 
       status: 'connected', 
       partnerId: null,
@@ -570,89 +577,35 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
     })
   },
   
-  // Capture 10-second voice sample
-  captureVoiceSample: async () => {
-    set({ isCapturingVoice: true })
+  // Set preferred TTS voice gender
+  setGender: (gender: string) => {
+    const validGender = gender === 'male' ? 'male' : 'female'
+    set({ gender: validGender })
     
-    return new Promise<void>((resolve) => {
-      const { AudioRecorder } = require('./audioUtils')
-      const recorder = new AudioRecorder()
-      
-      let voiceData: string[] = []
-      
-      recorder.startRecording((audioData: string) => {
-        voiceData.push(audioData)
-      })
-      
-      // Record for 10 seconds
-      setTimeout(() => {
-        recorder.stopRecording()
-        
-        // Properly combine base64 audio chunks
-        // Step 1: Decode each base64 chunk to bytes
-        const allBytes: number[] = []
-        for (const base64Chunk of voiceData) {
-          try {
-            const binaryString = atob(base64Chunk)
-            for (let i = 0; i < binaryString.length; i++) {
-              allBytes.push(binaryString.charCodeAt(i))
-            }
-          } catch (e) {
-            console.error('Failed to decode base64 chunk:', e)
-          }
-        }
-        
-        // Step 2: Convert bytes array to Uint8Array
-        const combinedBytes = new Uint8Array(allBytes)
-        
-        // Step 3: Re-encode to base64 (process in chunks to avoid stack overflow)
-        const chunkSize = 8192
-        let binaryString = ''
-        for (let i = 0; i < combinedBytes.length; i += chunkSize) {
-          const chunk = combinedBytes.slice(i, i + chunkSize)
-          binaryString += String.fromCharCode(...chunk)
-        }
-        const combinedVoice = btoa(binaryString)
-        
-        console.log(`Voice sample: ${voiceData.length} chunks, ${combinedBytes.length} bytes, ${combinedVoice.length} base64 chars`)
-        
-        // Send to server and store for reuse
-        get().sendVoiceSample(combinedVoice)
-        
-        // Save to localStorage for persistence
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('voiceSample', combinedVoice)
-          console.log('Voice sample saved to localStorage')
-        }
-        
-        set({ 
-          isCapturingVoice: false,
-          voiceSampleCaptured: true,
-          storedVoiceSample: combinedVoice  // Store for reuse
-        })
-        
-        resolve()
-      }, 10000)
-    })
-  },
-  
-  // Send voice sample to server
-  sendVoiceSample: (audioData: string) => {
+    // Notify server if connected
     const { ws } = get()
-    
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
-        type: 'voice_sample',
-        audio: audioData
+        type: 'set_gender',
+        gender: validGender
       }))
+    }
+    
+    // Persist preference
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('preferredGender', validGender)
     }
   },
   
   // Send audio chunk to server
   sendAudioChunk: (audioData: string) => {
-    const { ws, status } = get()
+    const { ws, status, ttsPlaying } = get()
     
     if (status !== 'paired') return
+    
+    // Echo suppression: don't send audio while TTS is playing
+    // (mic would pick up TTS speaker output and create feedback loop)
+    if (ttsPlaying) return
     
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -678,20 +631,6 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   // Toggle recording
   toggleRecording: () => {
     set({ isRecording: !get().isRecording })
-  },
-  
-  // Load voice sample from localStorage (call from useEffect client-side only)
-  loadVoiceSample: () => {
-    if (typeof window !== 'undefined') {
-      const voiceSample = localStorage.getItem('voiceSample')
-      if (voiceSample) {
-        set({ 
-          storedVoiceSample: voiceSample,
-          voiceSampleCaptured: true
-        })
-        console.log('Voice sample loaded from localStorage')
-      }
-    }
   },
   
   // WebRTC methods
@@ -791,11 +730,17 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       get().addMessage({
         text: 'Voice note',
         isOwn: true,
-        voiceNote: audioData
+        voiceNote: audioData,
+        type: 'voice_note'
       })
     } else {
       console.error('Cannot send voice note - WebSocket not ready')
     }
+  },
+  
+  clearMessages: () => {
+    set({ messages: [] })
+    console.log('🗑️ Messages cleared')
   },
   
   sendTypingIndicator: (isTyping) => {

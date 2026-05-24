@@ -41,11 +41,10 @@ class RealtimeAudioProcessor:
     - Interruptible TTS
     """
     
-    def __init__(self, user_id: str, source_lang: str, target_lang: str, voice_sample: Optional[bytes] = None):
+    def __init__(self, user_id: str, source_lang: str, target_lang: str):
         self.user_id = user_id
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self.voice_sample = voice_sample
         
         # Audio processing
         self.audio_queue = queue.Queue(maxsize=50)  # 1 second buffer (increased from 10)
@@ -61,6 +60,9 @@ class RealtimeAudioProcessor:
         self.last_partial = ""
         self.last_partial_time = 0.0
         self.transcription_pending = False  # Prevent duplicate transcriptions
+        self.speech_frame_count = 0  # Track actual speech frames in current utterance
+        self.pre_speech_buffer = []  # Small ring buffer for pre-speech context
+        self.max_pre_speech_frames = 10  # ~200ms of pre-speech audio
         
         # Thresholds (frame-counted, deterministic)
         self.commit_silence_ms = 500  # 25 frames
@@ -119,12 +121,12 @@ class RealtimeAudioProcessor:
                     
                     logger.info(f"Loading SHARED Whisper model on {device}...")
                     _global_whisper_model = WhisperModel(
-                        "base",  # Fast model for streaming
+                        "small",  # Better accuracy than 'base' (~244M params)
                         device=device,
                         compute_type=compute_type,
                         num_workers=2
                     )
-                    logger.info(f"✅ SHARED Whisper loaded on {device} (prevents OOM)")
+                    logger.info(f"✅ SHARED Whisper 'small' loaded on {device} (prevents OOM)")
                 except Exception as e:
                     logger.error(f"Failed to load Whisper: {e}")
                     raise
@@ -203,6 +205,12 @@ class RealtimeAudioProcessor:
         - Accumulate for ASR (fast)
         - Only transcribe on silence boundaries (slow, async)
         """
+        # ECHO SUPPRESSION: Skip all processing while TTS is playing for this user.
+        # The partner's TTS output plays through speakers and the mic picks it up,
+        # causing Whisper to transcribe the TTS audio (feedback loop).
+        if self.tts_active:
+            return
+        
         # Decode frame (fast: <1ms)
         frame_np = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
@@ -212,6 +220,16 @@ class RealtimeAudioProcessor:
         if is_speech:
             self.silence_duration = 0.0
             self.last_speech_time = timestamp
+            self.speech_frame_count += 1
+            
+            # Flush pre-speech buffer into audio_buffer on first speech frame
+            if self.speech_frame_count == 1 and self.pre_speech_buffer:
+                for pre_frame in self.pre_speech_buffer:
+                    self.audio_buffer.extend(pre_frame)
+                self.pre_speech_buffer = []
+            
+            # Accumulate ONLY speech frames
+            self.audio_buffer.extend(frame_np)
             
             # Interrupt TTS if speaking
             if self.tts_active:
@@ -224,34 +242,63 @@ class RealtimeAudioProcessor:
                     })
         else:
             self.silence_duration += self.frame_ms / 1000
-        
-        # Accumulate audio (fast: append to list)
-        self.audio_buffer.extend(frame_np)
+            
+            # Keep small pre-speech ring buffer (for natural speech onset)
+            self.pre_speech_buffer.append(frame_np.copy())
+            if len(self.pre_speech_buffer) > self.max_pre_speech_frames:
+                self.pre_speech_buffer.pop(0)
         
         # ONLY transcribe ONCE on silence boundaries
         # Reset flag when speech resumes
         if is_speech:
             self.transcription_pending = False
         
+        # Minimum speech frames required (at least ~300ms of actual speech)
+        min_speech_frames = 15
+        
         # Transcribe on silence boundary (once per utterance)
         if self.silence_duration > self.commit_silence_ms / 1000:
-            if not self.transcription_pending and len(self.audio_buffer) > 1600:
-                self.transcription_pending = True  # Prevent re-transcribing during same silence
-                self._transcribe_async(timestamp)
-                self.audio_buffer = []
-        
-        # Force transcription if buffer too large (safety)
-        elif len(self.audio_buffer) >= 16000 * 4:
-            if not self.transcription_pending:
+            if (not self.transcription_pending 
+                    and len(self.audio_buffer) > 1600 
+                    and self.speech_frame_count >= min_speech_frames):
                 self.transcription_pending = True
                 self._transcribe_async(timestamp)
                 self.audio_buffer = []
+                self.speech_frame_count = 0
+                self.pre_speech_buffer = []
+            elif self.speech_frame_count < min_speech_frames and self.audio_buffer:
+                # Too few speech frames — likely noise burst, discard
+                if self.speech_frame_count > 0:
+                    logger.info(f"⏭️ Only {self.speech_frame_count} speech frames (<{min_speech_frames}), discarding noise burst")
+                self.audio_buffer = []
+                self.speech_frame_count = 0
+        
+        # Force transcription if buffer too large (safety) — but still require speech
+        elif len(self.audio_buffer) >= 16000 * 4:
+            if not self.transcription_pending and self.speech_frame_count >= min_speech_frames:
+                self.transcription_pending = True
+                self._transcribe_async(timestamp)
+                self.audio_buffer = []
+                self.speech_frame_count = 0
+                self.pre_speech_buffer = []
+            else:
+                # Buffer overflow but insufficient speech — discard
+                logger.info(f"⏭️ Buffer overflow but only {self.speech_frame_count} speech frames, discarding")
+                self.audio_buffer = []
+                self.speech_frame_count = 0
+        
+        # Clear stale buffer on prolonged silence (>2s) to prevent noise accumulation
+        if self.silence_duration > 2.0 and self.audio_buffer:
+            logger.debug(f"🧹 Clearing stale audio buffer after {self.silence_duration:.1f}s silence")
+            self.audio_buffer = []
+            self.speech_frame_count = 0
+            self.pre_speech_buffer = []
     
     def _preprocess_audio(self, frame: np.ndarray) -> np.ndarray:
         """Fast preprocessing - RMS gating only (no FFT to avoid 500ms bottleneck)"""
         # Check RMS energy - if too low, zero it out
         rms = np.sqrt(np.mean(frame ** 2))
-        if rms < 0.003:  # Adjusted threshold for better noise rejection
+        if rms < 0.008:  # Stricter gate to reject ambient noise/buzzing
             return np.zeros_like(frame).astype(np.float32)
         
         # Simple high-pass filter only (fast: <2ms)
@@ -279,10 +326,11 @@ class RealtimeAudioProcessor:
             return self._rms_vad(frame_clean)
     
     def _rms_vad(self, frame: np.ndarray) -> bool:
-        """Simple RMS-based VAD with stricter threshold"""
+        """Simple RMS-based VAD with strict threshold to reject ambient noise"""
         rms = np.sqrt(np.mean(frame ** 2))
-        # Stricter threshold to reduce noise-based hallucinations (Matched with vad_gate.py)
-        return rms > 0.01
+        # Raised threshold: 0.02 rejects typical ambient buzzing/humming
+        # while still catching normal speech (which is usually 0.05+)
+        return rms > 0.02
     def _filter_repetitions(self, text: str, max_repeat: int = 3) -> str:
         """Filter out repetitive loops (hallucination detection)"""
         if not text:
@@ -334,6 +382,12 @@ class RealtimeAudioProcessor:
             logger.info(f"⏭️ Audio too short ({len(audio_np)/16000:.2f}s), skipping transcription")
             return
         
+        # Energy gate: reject buffers with very low overall energy (noise/silence)
+        buffer_rms = np.sqrt(np.mean(audio_np ** 2))
+        if buffer_rms < 0.015:
+            logger.info(f"⏭️ Buffer energy too low (RMS={buffer_rms:.4f}), likely noise — skipping transcription")
+            return
+        
         # Run transcription in thread
         import threading
         
@@ -347,13 +401,12 @@ class RealtimeAudioProcessor:
                 segments, info = self.whisper_model.transcribe(
                     audio_preprocessed,
                     language=self.source_lang,
-                    beam_size=1,
+                    beam_size=3,  # Explore multiple paths for better accuracy
                     best_of=1,
                     temperature=0.0,  # Deterministic (reduce creativity)
                     vad_filter=False,  # We do our own VAD
                     condition_on_previous_text=False,  # Reset context (prevent loops)
                     without_timestamps=True,  # Reduces errors significantly
-                    initial_prompt="Transcribe only actual speech. Ignore silence, pauses, and background noise."
                 )
                 
                 # Extract text with confidence filtering

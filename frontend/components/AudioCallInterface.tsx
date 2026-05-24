@@ -2,8 +2,8 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { 
-  Mic, MicOff, Phone, PhoneOff, Volume2, VolumeX,
-  User, MessageSquare, Settings, MoreVertical
+  Mic, MicOff, PhoneOff, Volume2, VolumeX,
+  User, MessageSquare
 } from 'lucide-react'
 import { useConnectionStore } from '@/lib/store'
 import { AudioWorkletCapture } from '@/lib/audioWorklet'
@@ -19,56 +19,32 @@ export default function AudioCallInterface({ language, onDisconnect }: AudioCall
   const [isVolumeOn, setIsVolumeOn] = useState(true)
   const [isChatOpen, setIsChatOpen] = useState(false)
   const [message, setMessage] = useState('')
-  const [isCapturingVoice, setIsCapturingVoice] = useState(false)
-  const [captureProgress, setCaptureProgress] = useState(0)
-  const [partialTranscript, setPartialTranscript] = useState('')
   
   const audioWorkletRef = useRef<AudioWorkletCapture | null>(null)
   const audioPlaybackRef = useRef<AudioPlayback | null>(null)
+  const hasCalledFindPartnerRef = useRef(false)
   
   // Zustand store
   const status = useConnectionStore(state => state.status)
   const partnerId = useConnectionStore(state => state.partnerId)
-  const voiceSampleCaptured = useConnectionStore(state => state.voiceSampleCaptured)
   const messages = useConnectionStore(state => state.messages)
-  const captureVoiceSample = useConnectionStore(state => state.captureVoiceSample)
   const findPartner = useConnectionStore(state => state.findPartner)
   const disconnect = useConnectionStore(state => state.disconnect)
   const sendAudioChunk = useConnectionStore(state => state.sendAudioChunk)
-  const loadVoiceSample = useConnectionStore(state => state.loadVoiceSample)
-  const storedVoiceSample = useConnectionStore(state => state.storedVoiceSample)
-  const initialize = useConnectionStore(state => state.initialize)
   
-  // Initialize WebSocket connection on mount
+  // NOTE: WebSocket initialization is handled by page.tsx when mode is selected
+  // Do NOT call initialize() here - it causes duplicate connections
+  
+  // Auto-find partner when connected (no voice sample needed anymore)
   useEffect(() => {
-    console.log('🎤 AudioCallInterface mount - status:', status)
-    if (status === 'disconnected') {
-      console.log('🎤 Initializing WebSocket...')
-      initialize()
+    if (status === 'connected' && !hasCalledFindPartnerRef.current) {
+      console.log('🎤 Auto-finding partner')
+      hasCalledFindPartnerRef.current = true
+      setTimeout(() => findPartner(), 500)
+    } else if (status === 'disconnected') {
+      hasCalledFindPartnerRef.current = false
     }
-  }, [])
-  
-  // Load voice sample from localStorage on mount (client-side only)
-  useEffect(() => {
-    console.log('🎤 Loading voice sample...')
-    loadVoiceSample()
-  }, [])
-  
-  // Log status changes
-  useEffect(() => {
-    console.log('🎤 Status changed to:', status)
-  }, [status])
-  
-  // Auto-find partner when connected AND voice sample is ready
-  useEffect(() => {
-    if (status === 'connected' && voiceSampleCaptured && storedVoiceSample) {
-      console.log('🎤 Auto-finding partner (connected + voice sample ready)')
-      // Small delay to ensure WebSocket is fully ready
-      setTimeout(() => {
-        findPartner()
-      }, 500)
-    }
-  }, [status, voiceSampleCaptured, storedVoiceSample])
+  }, [status, findPartner])
   
   // Start/stop audio recording based on mic state and partner status
   useEffect(() => {
@@ -143,30 +119,6 @@ export default function AudioCallInterface({ language, onDisconnect }: AudioCall
   
   const toggleVolume = () => setIsVolumeOn(!isVolumeOn)
   
-  const handleCaptureVoice = async () => {
-    setIsCapturingVoice(true)
-    setCaptureProgress(0)
-    
-    // Progress animation
-    const progressInterval = setInterval(() => {
-      setCaptureProgress(prev => Math.min(prev + 10, 100))
-    }, 1000)
-    
-    try {
-      await captureVoiceSample()
-    } finally {
-      clearInterval(progressInterval)
-      setIsCapturingVoice(false)
-      setCaptureProgress(0)
-    }
-  }
-  
-  const handleFindPartner = () => {
-    console.log('🎤 Find Partner button clicked')
-    console.log('🎤 Current state:', { status, voiceSampleCaptured, storedVoiceSample: !!storedVoiceSample })
-    findPartner()
-  }
-  
   const handleDisconnect = () => {
     stopAudioRecording()
     disconnect()
@@ -175,101 +127,8 @@ export default function AudioCallInterface({ language, onDisconnect }: AudioCall
 
   const sendMessage = () => {
     if (message.trim()) {
-      // Text messages not implemented yet - just for UI
       setMessage('')
     }
-  }
-
-  // Show voice sample capture UI ONLY if voice sample not captured yet
-  // Once we have a voice sample, always show the call screen (even while searching)
-  const showSetup = (status === 'disconnected' || status === 'connecting' || status === 'connected' || status === 'searching') && !voiceSampleCaptured
-  
-  console.log('🎤 UI Decision:', { 
-    showSetup, 
-    status, 
-    voiceSampleCaptured, 
-    storedVoiceSample: !!storedVoiceSample 
-  })
-  
-  if (showSetup) {
-    return (
-      <div className="h-screen bg-gradient-to-br from-[#1B3A57] via-[#0F2E4D] to-[#FF6B35] flex items-center justify-center p-8">
-        <div className="max-w-2xl w-full">
-          <div className="text-center mb-12">
-            <div className="inline-block bg-white rounded-2xl px-6 py-4 mb-6 shadow-2xl">
-              <img src="/verbyflow-logo.png" alt="VerbyFlow" className="h-16 w-auto" />
-            </div>
-            <h1 className="text-3xl font-bold text-white mb-4">Audio Call Mode</h1>
-            <p className="text-xl text-white/90">Real-time voice translation with AI</p>
-          </div>
-
-          <div className="bg-white/10 backdrop-blur-lg rounded-3xl p-8">
-            <div className="text-center mb-8">
-              <div className="w-24 h-24 bg-[#FF6B35] rounded-full mx-auto mb-6 flex items-center justify-center">
-                <Mic size={48} className="text-white" />
-              </div>
-              <h2 className="text-2xl font-bold text-white mb-3">
-                {storedVoiceSample ? 'Voice Sample Ready' : 'Capture Your Voice'}
-              </h2>
-              <p className="text-white/80 mb-6">
-                {storedVoiceSample 
-                  ? 'You already have a voice sample saved. Click below to find a partner.'
-                  : 'Record a 10-second sample so your partner hears your voice when translated'
-                }
-              </p>
-              
-              {isCapturingVoice && (
-                <div className="mb-6">
-                  <div className="w-full bg-white/20 rounded-full h-3 mb-2">
-                    <div 
-                      className="bg-[#FF6B35] h-3 rounded-full transition-all duration-1000"
-                      style={{ width: `${captureProgress}%` }}
-                    ></div>
-                  </div>
-                  <p className="text-white/90 text-sm">Recording... {Math.floor(captureProgress / 10)}s / 10s</p>
-                </div>
-              )}
-            </div>
-
-            {!storedVoiceSample ? (
-              <button
-                onClick={handleCaptureVoice}
-                disabled={isCapturingVoice}
-                className="w-full bg-[#FF6B35] hover:bg-[#FF8C5A] disabled:opacity-50 disabled:cursor-not-allowed text-white py-4 rounded-xl font-semibold text-lg transition-colors shadow-lg"
-              >
-                {isCapturingVoice ? 'Recording...' : 'Record Voice Sample'}
-              </button>
-            ) : (
-              <div className="space-y-3">
-                <button
-                  onClick={handleFindPartner}
-                  disabled={status === 'searching' || status === 'connecting'}
-                  className="w-full bg-[#FF6B35] hover:bg-[#FF8C5A] disabled:opacity-50 text-white py-4 rounded-xl font-semibold text-lg transition-colors shadow-lg"
-                >
-                  {status === 'searching' ? 'Finding Partner...' : 'Find Partner'}
-                </button>
-                <button
-                  onClick={handleCaptureVoice}
-                  disabled={isCapturingVoice}
-                  className="w-full bg-white/20 hover:bg-white/30 text-white py-3 rounded-xl font-medium transition-colors"
-                >
-                  Re-record Voice Sample
-                </button>
-              </div>
-            )}
-          </div>
-
-          <div className="text-center mt-8">
-            <button
-              onClick={handleDisconnect}
-              className="text-white/80 hover:text-white transition-colors"
-            >
-              ← Back to Mode Selection
-            </button>
-          </div>
-        </div>
-      </div>
-    )
   }
 
   return (

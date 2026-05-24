@@ -9,7 +9,7 @@ import logging
 import uuid
 
 from stt import process_audio_to_text
-from tts import process_text_to_audio, stream_text_to_audio, clear_voice_cache
+from tts import process_text_to_audio, stream_text_to_audio
 from translator import translate_text
 from realtime_audio_processor import RealtimeAudioProcessor
 from voice_note_processor import transcribe_voice_note
@@ -28,7 +28,7 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}  # user_id -> websocket
         self.paired_users: Dict[str, str] = {}  # user_id -> partner_id
         self.user_languages: Dict[str, str] = {}  # user_id -> language_code
-        self.voice_samples: Dict[str, str] = {}  # Store user voice samples
+        self.user_genders: Dict[str, str] = {}  # user_id -> gender ("male" or "female")
         self.message_history: Dict[str, List[Dict]] = {}  # pair_id -> messages (in-memory)
         self.lock = asyncio.Lock()
         
@@ -50,13 +50,10 @@ class ConnectionManager:
         source_lang = self.user_languages.get(user_id, "en")
         target_lang = self.user_languages.get(partner_id, "en")
         
-        # Get voice sample for TTS cloning
-        voice_sample = self.voice_samples.get(partner_id)
-        
         logger.info(f"Creating audio processor: {user_id} ({source_lang}) -> {partner_id} ({target_lang})")
         
-        # Create processor
-        processor = RealtimeAudioProcessor(user_id, source_lang, target_lang, voice_sample)
+        # Create processor (no voice sample needed - uses predefined voices)
+        processor = RealtimeAudioProcessor(user_id, source_lang, target_lang)
         
         # Initialize models in background
         await processor.initialize()
@@ -119,7 +116,7 @@ class ConnectionManager:
             })
             logger.info(f"💬 Text message sent to {partner_id}")
             
-            # Step 2: Generate TTS with PARTNER's voice sample
+            # Step 2: Generate TTS with predefined voice for PARTNER
             # CRITICAL: Cancel previous TTS if still running (prevent overlapping audio)
             if partner_id in self.active_tts_tasks:
                 old_task = self.active_tts_tasks[partner_id]
@@ -131,11 +128,8 @@ class ConnectionManager:
                     except asyncio.CancelledError:
                         pass
             
-            partner_voice_sample = self.voice_samples.get(partner_id)
-            
-            if not partner_voice_sample:
-                logger.warning(f"⚠️ No voice sample for partner {partner_id}, skipping TTS")
-                return
+            # Get partner's preferred gender for TTS output voice
+            partner_gender = self.user_genders.get(partner_id, "female")
             
             # Create and track TTS task
             async def generate_and_stream_tts():
@@ -143,12 +137,23 @@ class ConnectionManager:
                 chunk_count = 0
                 
                 try:
-                    # Use streaming TTS with correct parameters
+                    # ECHO SUPPRESSION: Tell partner's audio processor to suppress
+                    # while TTS is playing (prevents mic from re-transcribing TTS output)
+                    partner_processor = self.audio_processors.get(partner_id)
+                    if partner_processor:
+                        partner_processor.tts_active = True
+                        logger.info(f"🔇 Echo suppression ON for {partner_id}")
+                    
+                    # Notify partner's frontend to pause mic capture
+                    await self.send_to_user(partner_id, {
+                        'type': 'tts_playing',
+                    })
+                    
+                    # Use streaming TTS with predefined voice
                     async for audio_chunk in stream_text_to_audio(
                         text=translated, 
                         language=target_lang,
-                        user_id=partner_id,  # For voice caching
-                        voice_sample=partner_voice_sample
+                        gender=partner_gender
                     ):
                         chunk_count += 1
                         await self.send_to_user(partner_id, {
@@ -167,6 +172,21 @@ class ConnectionManager:
                     logger.info(f"🛑 TTS cancelled for {partner_id}")
                     raise
                 finally:
+                    # ECHO SUPPRESSION: Clear suppress mode after TTS completes
+                    # Add small delay for audio to finish playing on client
+                    await asyncio.sleep(0.5)
+                    if partner_processor:
+                        partner_processor.tts_active = False
+                        # Clear any audio that accumulated during TTS playback
+                        partner_processor.audio_buffer = []
+                        partner_processor.speech_frame_count = 0
+                        logger.info(f"🔊 Echo suppression OFF for {partner_id}")
+                    
+                    # Notify partner's frontend to resume mic capture
+                    await self.send_to_user(partner_id, {
+                        'type': 'tts_done',
+                    })
+                    
                     # Clean up task tracking
                     if partner_id in self.active_tts_tasks:
                         del self.active_tts_tasks[partner_id]
@@ -220,7 +240,7 @@ class ConnectionManager:
         # Clean up all references
         self.active_connections.pop(user_id, None)
         self.user_languages.pop(user_id, None)
-        self.voice_samples.pop(user_id, None)
+        self.user_genders.pop(user_id, None)
         
         logger.info(f"✅ User {user_id} fully disconnected and cleaned up")
         logger.info(f"Remaining pairs: {self.paired_users}")
@@ -302,21 +322,24 @@ manager = ConnectionManager()
 
 
 @router.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en"):
+async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en", gender: str = "female"):
     """
     Main WebSocket endpoint for user connections
     
     Query params:
     - lang: User's preferred language (e.g., 'en', 'es', 'fr')
+    - gender: Preferred TTS voice gender ('male' or 'female')
     """
     await manager.connect(websocket, user_id, lang)
+    manager.user_genders[user_id] = gender if gender in ("male", "female") else "female"
     
     try:
         # Send connection confirmation
         await websocket.send_json({
             "type": "connected",
             "user_id": user_id,
-            "language": lang
+            "language": lang,
+            "gender": manager.user_genders[user_id]
         })
         
         # Main message loop
@@ -325,16 +348,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
             data = await websocket.receive_json()
             message_type = data.get("type")
             
-            if message_type == "voice_sample":
-                # Store user's voice sample for TTS cloning
-                voice_audio = data.get("audio")
-                if voice_audio:
-                    manager.voice_samples[user_id] = voice_audio
-                    logger.info(f"Stored voice sample for user {user_id}")
-                    await websocket.send_json({
-                        "type": "voice_sample_received",
-                        "message": "Voice sample stored successfully"
-                    })
+            if message_type == "set_gender":
+                # Update user's preferred TTS voice gender
+                new_gender = data.get("gender", "female")
+                manager.user_genders[user_id] = new_gender if new_gender in ("male", "female") else "female"
+                logger.info(f"Updated gender for {user_id}: {manager.user_genders[user_id]}")
+                await websocket.send_json({
+                    "type": "gender_updated",
+                    "gender": manager.user_genders[user_id]
+                })
             
             elif message_type == "find_partner":
                 # Try to pair with someone
@@ -536,7 +558,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
                 })
                 
             elif message_type == "voice_note":
-                # Handle voice note with STT → Translation → TTS pipeline
+                # Handle voice note - transcribe, translate text, send original audio
                 partner_id = manager.paired_users.get(user_id)
                 
                 logger.info(f"🎤 Voice note from {user_id}: sender={user_id}, partner={partner_id}")
@@ -562,9 +584,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
                 target_lang = manager.user_languages.get(partner_id, "en")
                 
                 try:
-                    # Step 1: Transcribe voice note (STT)
-                    logger.info(f"📝 Transcribing voice note: {source_lang} → {target_lang}")
-                    transcribed_text, voice_sample_bytes = await transcribe_voice_note(audio_data, source_lang)
+                    # Step 1: Transcribe voice note
+                    logger.info(f"📝 Transcribing voice note: {source_lang}")
+                    transcribed_text, _ = await transcribe_voice_note(audio_data, source_lang)
                     
                     if not transcribed_text:
                         logger.warning("⚠️ Voice note transcription empty, skipping")
@@ -576,40 +598,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
                     
                     logger.info(f"✅ Transcribed: '{transcribed_text}'")
                     
-                    # Step 2: Translate if different languages
+                    # Step 2: Translate text if different languages
                     if source_lang != target_lang:
                         logger.info(f"🌐 Translating: {source_lang} → {target_lang}")
                         translated_text = await translate_text(transcribed_text, source_lang, target_lang)
+                        logger.info(f"✅ Translated: '{translated_text}'")
                     else:
                         translated_text = transcribed_text
                         logger.info(f"Same language ({source_lang}), no translation needed")
                     
-                    # Step 3: Generate TTS with sender's voice from the voice note
-                    logger.info(f"🔊 Generating TTS with sender's voice for partner {partner_id}")
+                    # Send original audio + translated text to partner
+                    await manager.send_to_user(partner_id, {
+                        "type": "voice_note_received",
+                        "audio": audio_data,  # Original audio (unchanged)
+                        "text": translated_text,  # Translated text for reading
+                        "original_text": transcribed_text,  # Original transcription
+                        "from_user": user_id,
+                        "timestamp": data.get("timestamp")
+                    })
                     
-                    # Convert voice sample bytes to base64 for TTS
-                    voice_sample_base64 = base64.b64encode(voice_sample_bytes).decode('utf-8')
-                    
-                    # Stream TTS to partner using sender's voice
-                    chunk_count = 0
-                    async for audio_chunk in stream_text_to_audio(
-                        text=translated_text,
-                        language=target_lang,
-                        user_id=f"voice_note_{user_id}",  # Unique cache key for voice notes
-                        voice_sample=voice_sample_base64
-                    ):
-                        chunk_count += 1
-                        # Send as voice_note_received with TTS audio
-                        await manager.send_to_user(partner_id, {
-                            "type": "voice_note_received",
-                            "audio": audio_chunk,
-                            "text": translated_text if chunk_count == 1 else None,
-                            "original_text": transcribed_text,
-                            "from_user": user_id,
-                            "timestamp": data.get("timestamp")
-                        })
-                    
-                    logger.info(f"✅ Voice note translated and sent to {partner_id} ({chunk_count} chunks)")
+                    logger.info(f"✅ Voice note sent to {partner_id} with translated text")
                     
                     # Confirm to sender
                     await websocket.send_json({
@@ -653,10 +661,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, lang: str = "en
     except WebSocketDisconnect:
         partner_id = await manager.disconnect(user_id)
         
-        # Clear voice cache for this user
-        clear_voice_cache(user_id)
-        logger.info(f"Cleared voice cache for disconnected user {user_id}")
-        
         if partner_id:
             # Notify partner
             await manager.send_to_user(partner_id, {
@@ -674,4 +678,18 @@ async def get_stats():
         "active_connections": len(manager.active_connections),
         "waiting_queue": len(manager.waiting_queue),
         "active_pairs": len(manager.paired_users) // 2
+    }
+
+
+@router.get("/voices")
+async def get_voices():
+    """
+    Return available predefined voices mapped by language and gender.
+    Frontend can use this to populate language/gender selectors.
+    """
+    from tts import get_supported_voices
+    return {
+        "voices": get_supported_voices(),
+        "supported_genders": ["male", "female"],
+        "default_gender": "female"
     }

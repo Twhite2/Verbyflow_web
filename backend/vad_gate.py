@@ -248,19 +248,43 @@ class HallucinationFilter:
     
     # Common hallucination patterns in different languages
     HALLUCINATION_PATTERNS = [
-        # English
+        # English - repeated phrases
         r'\bthank you\b.*\bthank you\b',
         r'\bgoodbye\b.*\bgoodbye\b',
         r'\bsubtitles?\b.*\bsubtitles?\b',
+        
+        # English - common Whisper silence hallucinations
+        r'^\s*thank you( for watching| for listening)?\s*\.?\s*$',
+        r'^\s*thanks for watching\s*\.?\s*$',
+        r'^\s*please subscribe\s*\.?\s*$',
+        r'^\s*subscribe\s*\.?\s*$',
+        r'^\s*like and subscribe\s*\.?\s*$',
+        r'^\s*see you (next time|in the next|later)\s*\.?\s*$',
+        r'^\s*you$',
+        r'^\s*\.+\s*$',
+        r'^\s*i\'m going to\s*\.?\s*$',
+        r'^\s*so\s*\.?\s*$',
+        r'^\s*okay\s*\.?\s*$',
+        r'^\s*the\s*\.?\s*$',
+        r'^\s*and\s*\.?\s*$',
+        r'^\s*\.*\s*$',
         
         # French
         r'\bmerci\b.*\bmerci\b',
         r'\bau revoir\b.*\bau revoir\b',
         r'\bvisa pour le visa\b',
+        r'^\s*merci (d\'avoir regard|pour).*$',
+        r'^\s*sous[- ]?titres\b',
         
         # Spanish
         r'\bgracias\b.*\bgracias\b',
         r'\badiós\b.*\badiós\b',
+        r'^\s*gracias por ver\b',
+        r'^\s*suscr[ií]b',
+        
+        # German
+        r'^\s*danke f[uü]r',
+        r'^\s*untertitel\b',
         
         # Repetitive single words
         r'\b(\w+)\s+\1\s+\1\b',  # word word word
@@ -268,6 +292,17 @@ class HallucinationFilter:
         # Generic repetition
         r'(.{5,})\s+\1\s+\1',  # phrase phrase phrase
     ]
+    
+    # Exact phrases that are almost always hallucinations on silence
+    EXACT_HALLUCINATIONS = {
+        "thank you", "thanks", "thank you for watching",
+        "thanks for watching", "please subscribe", "subscribe",
+        "like and subscribe", "see you next time", "goodbye",
+        "you", "the", "so", "and", "okay", "ok",
+        "bye", "bye bye", "yes", "no", "hmm", "um",
+        "merci", "gracias", "danke", "arigato",
+        "sous-titres", "subtitles", "untertitel",
+    }
     
     @staticmethod
     def is_hallucination(text: str) -> bool:
@@ -277,8 +312,14 @@ class HallucinationFilter:
         """
         import re
         
-        text_lower = text.lower()
+        text_lower = text.lower().strip().rstrip('.')
         
+        # Check exact match against known hallucination phrases
+        if text_lower in HallucinationFilter.EXACT_HALLUCINATIONS:
+            logger.debug(f"🚫 Exact hallucination match: '{text}'")
+            return True
+        
+        # Check regex patterns
         for pattern in HallucinationFilter.HALLUCINATION_PATTERNS:
             if re.search(pattern, text_lower):
                 logger.debug(f"🚫 Detected hallucination pattern: '{text}'")

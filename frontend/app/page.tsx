@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Globe } from 'lucide-react'
+import { Globe, User } from 'lucide-react'
 import ModeSelector from '@/components/ModeSelector'
 import VideoCallInterface from '@/components/VideoCallInterface'
 import AudioCallInterface from '@/components/AudioCallInterface'
@@ -31,8 +31,20 @@ export default function Home() {
   
   const language = useConnectionStore((state) => state.language)
   const setLanguage = useConnectionStore((state) => state.setLanguage)
+  const gender = useConnectionStore((state) => state.gender)
+  const setGender = useConnectionStore((state) => state.setGender)
   const initializeConnection = useConnectionStore((state) => state.initialize)
   const status = useConnectionStore((state) => state.status)
+
+  // Load persisted gender preference on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('preferredGender')
+      if (saved === 'male' || saved === 'female') {
+        setGender(saved)
+      }
+    }
+  }, [])
 
   // Initialize connection when mode is selected
   useEffect(() => {
@@ -111,8 +123,15 @@ export default function Home() {
       <div>
         <ModeSelector onModeSelect={handleModeSelect} />
         
-        {/* Language selector button (floating) */}
-        <div className="fixed bottom-8 right-8">
+        {/* Language & Gender selector buttons (floating) */}
+        <div className="fixed bottom-8 right-8 flex items-center space-x-3">
+          <button
+            onClick={() => setGender(gender === 'male' ? 'female' : 'male')}
+            className="bg-white hover:bg-gray-50 text-[#1B3A57] px-5 py-3 rounded-full shadow-xl flex items-center space-x-2 transition-all hover:scale-105"
+          >
+            <User size={20} />
+            <span className="font-medium capitalize">{gender}</span>
+          </button>
           <button
             onClick={() => setShowLanguageSelect(true)}
             className="bg-white hover:bg-gray-50 text-[#1B3A57] px-6 py-3 rounded-full shadow-xl flex items-center space-x-2 transition-all hover:scale-105"
